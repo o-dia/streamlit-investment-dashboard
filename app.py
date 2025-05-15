@@ -262,86 +262,158 @@ def parse_schwab_data(raw_data):
 
 def connect_to_ib():
     """
-    Connect to the Interactive Brokers API
+    Connect to the Interactive Brokers Client Portal API
     
     Returns:
     - dict or None: Connection information or None if connection failed
     
-    Note: This is a placeholder function. In a real implementation,
-    you would import and use the IB API client.
+    This function:
+    1. Checks if the IB Gateway is running on the specified port
+    2. Verifies authentication with the IB API
+    3. Returns connection status information
     """
-    # Check if IB credentials are configured
-    if not IB_CLIENT_ID:
-        st.warning("Interactive Brokers credentials not configured in .env file")
-        return None
+    # Base URL for the IB Client Portal API Gateway
+    IB_GATEWAY_URL = f"https://localhost:{os.getenv('IB_GATEWAY_PORT', '5001')}"
     
     try:
-        # Simulate a successful connection for demonstration purposes
-        # In a real implementation, this would connect to the IB API Gateway
+        # Check if the gateway is running and authenticated
+        auth_status_url = f"{IB_GATEWAY_URL}/v1/portal/iserver/auth/status"
+        
+        # Make the request - we use verify=False because the gateway uses a self-signed certificate
+        response = requests.get(auth_status_url, verify=False)
+        
+        # Check if request was successful
+        if response.status_code != 200:
+            st.error(f"Error connecting to IB Gateway: HTTP {response.status_code}")
+            return None
+        
+        # Parse the response
+        status_data = response.json()
+        
+        # Check if authenticated
+        if not status_data.get("authenticated", False):
+            st.warning("IB Gateway is running but not authenticated. Please log in through the gateway.")
+            st.info(f"Open {IB_GATEWAY_URL} in your browser and log in with your IB credentials.")
+            return None
+        
+        # Check if connected to IB servers
+        if not status_data.get("connected", False):
+            st.warning("IB Gateway is not connected to Interactive Brokers servers.")
+            return None
+        
+        # Successfully connected and authenticated
+        st.success(f"Connected to Interactive Brokers via Client Portal API Gateway")
         
         # Store connection status in session state
         st.session_state["ib_connected"] = True
+        st.session_state["ib_gateway_url"] = IB_GATEWAY_URL
         
-        # Return a mock connection object
-        return {"connected": True, "client_id": IB_CLIENT_ID}
+        # Return connection information
+        return {
+            "connected": True,
+            "gateway_url": IB_GATEWAY_URL,
+            "server_version": status_data.get("serverInfo", {}).get("serverVersion", "Unknown")
+        }
     
-    # Handle any errors during connection
+    except requests.exceptions.ConnectionError:
+        st.error(f"Could not connect to IB Gateway at {IB_GATEWAY_URL}")
+        st.info("Make sure the IB Client Portal API Gateway is running and accessible.")
+        return None
+    
     except Exception as e:
         st.error(f"Error connecting to Interactive Brokers: {str(e)}")
         return None
 
 def get_ib_account_data():
     """
-    Fetch account data from Interactive Brokers
+    Fetch account data from Interactive Brokers Client Portal API
     
     Returns:
-    - dict: Sample account data for demonstration
+    - dict: Account data including account summaries and positions
+    - None: If there was an error or no data could be retrieved
     
-    Note: This is a placeholder function that returns sample data.
-    In a real implementation, you would use the IB API to fetch actual data.
+    This function makes API calls to the IB Gateway to retrieve:
+    1. List of accounts
+    2. Account summary (portfolio values)
+    3. Account positions (holdings)
     """
-    # This is sample data to demonstrate the UI functionality
-    # In a real app, this would be replaced with actual API calls
-    sample_data = {
-        # Account summary information
-        "account_summary": {
-            "U1234567": {  # Account ID
-                "NetLiquidation": {"value": "105432.78", "currency": "USD"},  # Total value
-                "TotalCashValue": {"value": "25876.45", "currency": "USD"},   # Cash balance
-                "AvailableFunds": {"value": "25876.45", "currency": "USD"}    # Available funds
-            }
-        },
-        # Position information
-        "positions": [
-            {
-                "account": "U1234567",   # Account ID
-                "symbol": "AAPL",        # Stock symbol
-                "secType": "STK",        # Security type (stock)
-                "exchange": "NASDAQ",    # Exchange
-                "position": 50,          # Number of shares
-                "avgCost": 182.45        # Average cost per share
-            },
-            {
-                "account": "U1234567",
-                "symbol": "MSFT",
-                "secType": "STK",
-                "exchange": "NASDAQ",
-                "position": 25,
-                "avgCost": 334.67
-            },
-            {
-                "account": "U1234567",
-                "symbol": "VTI",
-                "secType": "ETF",         # Security type (ETF)
-                "exchange": "NYSE",
-                "position": 100,
-                "avgCost": 217.89
-            }
-        ]
-    }
+    # Check if we're connected to IB
+    if not st.session_state.get("ib_connected", False):
+        st.warning("Not connected to Interactive Brokers. Please connect first.")
+        return None
+        
+    # Get the gateway URL from session state
+    gateway_url = st.session_state.get("ib_gateway_url")
     
-    # Return the sample data
-    return sample_data
+    try:
+        # Structure to hold our account data
+        account_data = {
+            "account_summary": {},
+            "positions": []
+        }
+        
+        # Step 1: Get account list
+        accounts_url = f"{gateway_url}/v1/portal/iserver/accounts"
+        accounts_response = requests.get(accounts_url, verify=False)
+        
+        if accounts_response.status_code != 200:
+            st.error(f"Failed to get accounts: HTTP {accounts_response.status_code}")
+            return None
+            
+        accounts = accounts_response.json()
+        
+        # Check if we have any accounts
+        if not accounts or len(accounts) == 0:
+            st.warning("No accounts found at Interactive Brokers.")
+            return None
+        
+        # Step 2: Get portfolio data for each account
+        for account_id in accounts:
+            # Get account summary (portfolio value)
+            summary_url = f"{gateway_url}/v1/portal/portfolio/{account_id}/summary"
+            summary_response = requests.get(summary_url, verify=False)
+            
+            if summary_response.status_code == 200:
+                summary = summary_response.json()
+                
+                # Add to account summary
+                account_data["account_summary"][account_id] = {
+                    "NetLiquidation": {"value": str(summary.get("netLiquidation", 0)), "currency": summary.get("currency", "USD")},
+                    "TotalCashValue": {"value": str(summary.get("totalCashValue", 0)), "currency": summary.get("currency", "USD")},
+                    "AvailableFunds": {"value": str(summary.get("availableFunds", 0)), "currency": summary.get("currency", "USD")}
+                }
+            
+            # Get positions for this account
+            positions_url = f"{gateway_url}/v1/portal/portfolio/{account_id}/positions"
+            positions_response = requests.get(positions_url, verify=False)
+            
+            if positions_response.status_code == 200:
+                positions = positions_response.json()
+                
+                # Process each position
+                for position in positions:
+                    # Extract the necessary data
+                    contract = position.get("contract", {})
+                    position_data = {
+                        "account": account_id,
+                        "symbol": contract.get("symbol", "Unknown"),
+                        "secType": contract.get("secType", "STK"),
+                        "exchange": contract.get("exchange", "Unknown"),
+                        "position": float(position.get("position", 0)),
+                        "avgCost": float(position.get("avgPrice", 0))
+                    }
+                    
+                    # Add to positions list
+                    account_data["positions"].append(position_data)
+        
+        # Return the complete data
+        return account_data
+        
+    except Exception as e:
+        st.error(f"Error retrieving IB account data: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
 
 def parse_ib_data(ib_data):
     """
@@ -352,6 +424,9 @@ def parse_ib_data(ib_data):
     
     Returns:
     - dict or None: Structured portfolio data or None if parsing failed
+    
+    This function transforms the raw API response into a format that's
+    consistent with the rest of the dashboard's data structure.
     """
     # Check if data is None
     if ib_data is None:
@@ -386,12 +461,16 @@ def parse_ib_data(ib_data):
         # Process position information
         # Iterate through each position in the positions array
         for position in ib_data["positions"]:
-            # Calculate market value (position size * average cost)
-            # In a real app, you'd use current price data for accuracy
+            # Calculate market value
             market_value = position["position"] * position["avgCost"]
             
-            # Calculate cost basis (position size * average cost)
+            # Calculate cost basis
             cost_basis = position["position"] * position["avgCost"]
+            
+            # Calculate unrealized P/L (in a real implementation, this would use current prices)
+            # For now, we'll set it to 0 since we don't have current price data
+            unrealized_pl = 0
+            unrealized_pl_percent = 0
             
             # Add position details to the positions array
             parsed_data["positions"].append({
@@ -401,8 +480,8 @@ def parse_ib_data(ib_data):
                 "quantity": position["position"],                       # Number of shares
                 "market_value": market_value,                          # Current value
                 "cost_basis": cost_basis,                              # Purchase cost
-                "unrealized_pl": 0,  # Would need current price data for accurate value
-                "unrealized_pl_percent": 0  # Would need current price data for accurate value
+                "unrealized_pl": unrealized_pl,                        # Profit/loss
+                "unrealized_pl_percent": unrealized_pl_percent         # P/L percentage
             })
             
         # Return the fully structured data
