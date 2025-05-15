@@ -270,7 +270,7 @@ def connect_to_ib():
     This function:
     1. Checks if the IB Gateway is running on the specified port
     2. Verifies authentication with the IB API
-    3. Returns connection status information
+    3. Returns connection status information 
     """
     # Base URL for the IB Client Portal API Gateway
     IB_GATEWAY_URL = f"https://localhost:{os.getenv('IB_GATEWAY_PORT', '5001')}"
