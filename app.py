@@ -46,7 +46,7 @@ SCHWAB_REDIRECT_URI = os.getenv("SCHWAB_REDIRECT_URI", "https://your-ngrok-url.n
 # Interactive Brokers configuration with default values
 # These will be loaded from .env when implemented
 IB_CLIENT_ID = os.getenv("IB_CLIENT_ID", "")  # Empty string default means no value
-IB_GATEWAY_PORT = os.getenv("IB_GATEWAY_PORT", "4001")  # Default port is 4001
+IB_GATEWAY_PORT = os.getenv("IB_GATEWAY_PORT", "5001")  # Default port matches Client Portal Gateway
 IB_HOST = os.getenv("IB_HOST", "127.0.0.1")  # Default to localhost
 
 # API endpoints for Schwab services
@@ -273,16 +273,22 @@ def connect_to_ib():
     3. Returns connection status information 
     """
     # Base URL for the IB Client Portal API Gateway
-    IB_GATEWAY_URL = f"https://localhost:{os.getenv('IB_GATEWAY_PORT', '5001')}"
-    
+    IB_GATEWAY_URL = f"https://{IB_HOST}:{IB_GATEWAY_PORT}"
+    session = requests.Session()
+    session.verify = False
+
     try:
         # Check if the gateway is running and authenticated
-        auth_status_url = f"{IB_GATEWAY_URL}/v1/portal/iserver/auth/status"
+        auth_status_url = f"{IB_GATEWAY_URL}/v1/api/iserver/auth/status"
         
         # Make the request - we use verify=False because the gateway uses a self-signed certificate
-        response = requests.get(auth_status_url, verify=False)
+        response = session.get(auth_status_url)
         
         # Check if request was successful
+        if response.status_code == 401:
+            st.warning("Interactive Brokers API session is not authenticated. Log in at the gateway UI first.")
+            st.info(f"Open {IB_GATEWAY_URL} in your browser, log in, then try connecting again.")
+            return None
         if response.status_code != 200:
             st.error(f"Error connecting to IB Gateway: HTTP {response.status_code}")
             return None
@@ -307,6 +313,7 @@ def connect_to_ib():
         # Store connection status in session state
         st.session_state["ib_connected"] = True
         st.session_state["ib_gateway_url"] = IB_GATEWAY_URL
+        st.session_state["ib_session"] = session
         
         # Return connection information
         return {
@@ -344,68 +351,132 @@ def get_ib_account_data():
         
     # Get the gateway URL from session state
     gateway_url = st.session_state.get("ib_gateway_url")
-    
+    session = st.session_state.get("ib_session")
+    if session is None:
+        session = requests.Session()
+        session.verify = False
+
     try:
+        st.session_state["ib_last_fetch"] = datetime.now().isoformat()
         # Structure to hold our account data
         account_data = {
             "account_summary": {},
-            "positions": []
+            "positions": [],
+            "accounts_meta": {}
         }
-        
-        # Step 1: Get account list
-        accounts_url = f"{gateway_url}/v1/portal/iserver/accounts"
-        accounts_response = requests.get(accounts_url, verify=False)
-        
-        if accounts_response.status_code != 200:
-            st.error(f"Failed to get accounts: HTTP {accounts_response.status_code}")
+
+        # Step 0: Validate API session before portfolio calls
+        sso_response = session.get(f"{gateway_url}/v1/api/sso/validate?gw=1")
+        if sso_response.status_code != 200:
+            st.error("IB Gateway SSO validation failed. Please log in at the gateway UI and try again.")
             return None
-            
-        accounts = accounts_response.json()
+
+        # Step 1: Get account list
+        accounts_response = None
+        accounts_urls = [
+            f"{gateway_url}/v1/api/portfolio/accounts",
+            f"{gateway_url}/v1/api/iserver/accounts"
+        ]
+        for url in accounts_urls:
+            response = session.get(url)
+            if response.status_code == 200:
+                accounts_response = response
+                break
+        
+        if accounts_response is None:
+            st.error("Failed to get accounts from IB Gateway. Make sure the API session is authenticated.")
+            return None
+        
+        accounts_payload = accounts_response.json()
         
         # Check if we have any accounts
-        if not accounts or len(accounts) == 0:
+        if not accounts_payload:
             st.warning("No accounts found at Interactive Brokers.")
             return None
         
+        accounts = []
+        if isinstance(accounts_payload, dict) and "accounts" in accounts_payload:
+            accounts = accounts_payload.get("accounts", [])
+        elif isinstance(accounts_payload, list):
+            accounts = accounts_payload
+        else:
+            accounts = [accounts_payload]
+
+        account_ids = []
+        for account in accounts:
+            if isinstance(account, dict):
+                account_id = account.get("accountId") or account.get("account") or account.get("id")
+            else:
+                account_id = account
+            if account_id:
+                account_ids.append(str(account_id))
+                if isinstance(account, dict):
+                    account_data["accounts_meta"][str(account_id)] = {
+                        "account_type": account.get("type") or account.get("acctCustType"),
+                        "display_name": account.get("displayName") or account.get("accountTitle") or account.get("accountAlias"),
+                        "currency": account.get("currency")
+                    }
+        
+        if not account_ids:
+            st.warning("No account IDs found in IB accounts response.")
+            return None
+        
+        def fetch_positions_for_account(account_id):
+            positions = []
+            page = 0
+            max_pages = 50
+            while page < max_pages:
+                positions_url = f"{gateway_url}/v1/api/portfolio/{account_id}/positions"
+                params = {"page": page} if page > 0 else None
+                response = session.get(positions_url, params=params)
+                if response.status_code != 200:
+                    break
+
+                payload = response.json()
+                if isinstance(payload, dict) and "positions" in payload:
+                    positions_page = payload.get("positions", [])
+                    positions.extend(positions_page)
+
+                    total = payload.get("total")
+                    page_value = payload.get("page")
+                    if total is None:
+                        break
+                    if len(positions) >= int(total):
+                        break
+                    page = int(page_value) + 1 if page_value is not None else page + 1
+                elif isinstance(payload, list):
+                    positions.extend(payload)
+                    break
+                else:
+                    break
+
+            return positions
+
         # Step 2: Get portfolio data for each account
-        for account_id in accounts:
+        for account_id in account_ids:
             # Get account summary (portfolio value)
-            summary_url = f"{gateway_url}/v1/portal/portfolio/{account_id}/summary"
-            summary_response = requests.get(summary_url, verify=False)
+            summary_url = f"{gateway_url}/v1/api/portfolio/{account_id}/summary"
+            summary_response = session.get(summary_url)
             
             if summary_response.status_code == 200:
                 summary = summary_response.json()
                 
                 # Add to account summary
-                account_data["account_summary"][account_id] = {
-                    "NetLiquidation": {"value": str(summary.get("netLiquidation", 0)), "currency": summary.get("currency", "USD")},
-                    "TotalCashValue": {"value": str(summary.get("totalCashValue", 0)), "currency": summary.get("currency", "USD")},
-                    "AvailableFunds": {"value": str(summary.get("availableFunds", 0)), "currency": summary.get("currency", "USD")}
-                }
+                account_data["account_summary"][account_id] = summary
             
             # Get positions for this account
-            positions_url = f"{gateway_url}/v1/portal/portfolio/{account_id}/positions"
-            positions_response = requests.get(positions_url, verify=False)
-            
-            if positions_response.status_code == 200:
-                positions = positions_response.json()
-                
-                # Process each position
-                for position in positions:
-                    # Extract the necessary data
-                    contract = position.get("contract", {})
-                    position_data = {
-                        "account": account_id,
-                        "symbol": contract.get("symbol", "Unknown"),
-                        "secType": contract.get("secType", "STK"),
-                        "exchange": contract.get("exchange", "Unknown"),
-                        "position": float(position.get("position", 0)),
-                        "avgCost": float(position.get("avgPrice", 0))
-                    }
-                    
-                    # Add to positions list
-                    account_data["positions"].append(position_data)
+            positions = fetch_positions_for_account(account_id)
+            for position in positions:
+                if isinstance(position, dict):
+                    position.setdefault("accountId", account_id)
+                account_data["positions"].append(position)
         
+        st.session_state["ib_last_account_count"] = len(account_ids)
+        st.session_state["ib_last_position_count"] = len(account_data["positions"])
+        st.session_state["ib_last_currencies"] = sorted({
+            pos.get("currency") for pos in account_data["positions"] if isinstance(pos, dict) and pos.get("currency")
+        })
+
         # Return the complete data
         return account_data
         
@@ -433,6 +504,18 @@ def parse_ib_data(ib_data):
         return None
         
     try:
+        def read_summary_value(summary_map, keys):
+            for key in keys:
+                if key in summary_map:
+                    value = summary_map[key]
+                    if isinstance(value, dict):
+                        amount = value.get("amount")
+                        if amount is not None:
+                            return amount
+                        return value.get("value", 0)
+                    return value
+            return 0
+
         # Initialize the structured data with empty values
         parsed_data = {
             "total_value": 0,           # Will hold the sum of all account values
@@ -442,46 +525,128 @@ def parse_ib_data(ib_data):
         
         # Process account summary information
         # Iterate through each account in the account_summary dictionary
+        accounts_meta = ib_data.get("accounts_meta", {})
         for account_id, summary in ib_data["account_summary"].items():
+            if isinstance(summary, list):
+                summary_map = {}
+                for item in summary:
+                    tag = item.get("tag")
+                    if tag:
+                        summary_map[tag] = {"value": item.get("value", 0), "currency": item.get("currency")}
+            elif isinstance(summary, dict):
+                summary_map = summary
+            else:
+                summary_map = {}
+
             # Extract net liquidation value (total account value)
             # Using nested .get() calls with default values in case keys don't exist
-            account_value = float(summary.get("NetLiquidation", {}).get("value", 0))
+            account_value = float(read_summary_value(
+                summary_map,
+                [
+                    "NetLiquidation",
+                    "netLiquidation",
+                    "EquityWithLoanValue",
+                    "equityWithLoanValue",
+                    "TotalCashValue",
+                    "totalCashValue"
+                ]
+            ) or 0)
             
             # Add this account's value to the total
             parsed_data["total_value"] += account_value
             
             # Add account details to the accounts array
+            account_meta = accounts_meta.get(str(account_id), {})
             parsed_data["accounts"].append({
                 "account_id": account_id,               # Account identifier
-                "account_name": f"IB {account_id}",     # Create a display name
-                "account_type": "Investment",           # Default account type
-                "value": account_value                  # Account value
+                "account_name": account_meta.get("display_name") or f"IB {account_id}",     # Create a display name
+                "account_type": account_meta.get("account_type") or "Investment",           # Default account type
+                "value": account_value,                  # Account value
+                "currency": account_meta.get("currency", "Unknown")
             })
+
+            cash_value = float(read_summary_value(
+                summary_map,
+                [
+                    "availablefunds",
+                    "AvailableFunds",
+                    "availableFunds",
+                    "TotalCashValue",
+                    "totalCashValue",
+                    "CashBalance",
+                    "cashBalance"
+                ]
+            ) or 0)
+            if cash_value > 0:
+                parsed_data["positions"].append({
+                    "account_id": account_id,
+                    "symbol": "CASH",
+                    "description": "Cash",
+                    "quantity": 1,
+                    "market_value": cash_value,
+                    "cost_basis": cash_value,
+                    "unrealized_pl": 0,
+                    "unrealized_pl_percent": 0,
+                    "currency": account_meta.get("currency", "Unknown"),
+                    "asset_class": "Cash",
+                    "conid": None
+                })
         
         # Process position information
         # Iterate through each position in the positions array
         for position in ib_data["positions"]:
             # Calculate market value
-            market_value = position["position"] * position["avgCost"]
+            quantity = float(position.get("position", position.get("quantity", 0)) or 0)
+            avg_cost = float(position.get("avgCost", position.get("avgPrice", 0)) or 0)
+            market_value = position.get("mktValue", position.get("marketValue"))
+            if market_value is None:
+                mkt_price = float(position.get("mktPrice", avg_cost) or 0)
+                market_value = quantity * mkt_price
             
             # Calculate cost basis
-            cost_basis = position["position"] * position["avgCost"]
+            cost_basis = position.get("costBasis")
+            if cost_basis is None:
+                cost_basis = quantity * avg_cost
             
             # Calculate unrealized P/L (in a real implementation, this would use current prices)
             # For now, we'll set it to 0 since we don't have current price data
-            unrealized_pl = 0
-            unrealized_pl_percent = 0
+            unrealized_pl = position.get("unrealizedPnl")
+            if unrealized_pl is None:
+                unrealized_pl = market_value - cost_basis
+            unrealized_pl_percent = position.get("unrealizedPnlPct")
+            if unrealized_pl_percent is None:
+                unrealized_pl_percent = (unrealized_pl / cost_basis * 100) if cost_basis else 0
             
             # Add position details to the positions array
+            symbol = position.get("symbol") or position.get("ticker") or position.get("contractDesc") or "Unknown"
+            asset_class = position.get("secType") or position.get("assetClass") or "N/A"
+            description = position.get("description") or position.get("contractDesc") or symbol
+            def map_asset_class(raw_asset_class):
+                if raw_asset_class in ("STK", "OPT", "WAR"):
+                    return "Stocks"
+                if raw_asset_class in ("ETF",):
+                    return "ETFs"
+                if raw_asset_class in ("CASH",):
+                    return "Cash"
+                if raw_asset_class in ("BOND", "BILL"):
+                    return "Bonds"
+                if raw_asset_class in ("FUND", "MMF"):
+                    return "Money Market Funds"
+                return "Other"
+
+            raw_asset_class = position.get("assetClass") or position.get("secType")
             parsed_data["positions"].append({
-                "account_id": position["account"],                     # Link to account
-                "symbol": position["symbol"],                          # Stock symbol
-                "description": f"{position['symbol']} ({position['secType']})", # Description
-                "quantity": position["position"],                       # Number of shares
+                "account_id": position.get("acctId", position.get("account", position.get("accountId", "Unknown"))), # Link to account
+                "symbol": symbol,                          # Stock symbol
+                "description": f"{description} ({asset_class})", # Description
+                "quantity": quantity,                       # Number of shares
                 "market_value": market_value,                          # Current value
                 "cost_basis": cost_basis,                              # Purchase cost
                 "unrealized_pl": unrealized_pl,                        # Profit/loss
-                "unrealized_pl_percent": unrealized_pl_percent         # P/L percentage
+                "unrealized_pl_percent": unrealized_pl_percent,         # P/L percentage
+                "currency": position.get("currency"),
+                "asset_class": map_asset_class(raw_asset_class),
+                "conid": position.get("conid")
             })
             
         # Return the fully structured data
@@ -491,6 +656,165 @@ def parse_ib_data(ib_data):
     except Exception as e:
         st.error(f"Error parsing IB data: {str(e)}")
         return None
+
+def get_ib_status():
+    """
+    Fetch authentication status and basic account details from IB Gateway
+
+    Returns:
+    - dict: status info with auth flags, server version, and account IDs
+    - None: if the gateway is unreachable
+    """
+    gateway_url = st.session_state.get("ib_gateway_url")
+    session = st.session_state.get("ib_session")
+    if not gateway_url:
+        return None
+    if session is None:
+        session = requests.Session()
+        session.verify = False
+
+    status_url = f"{gateway_url}/v1/api/iserver/auth/status"
+    status_response = session.get(status_url)
+    if status_response.status_code != 200:
+        return {
+            "http_status": status_response.status_code,
+            "authenticated": False,
+            "connected": False,
+            "message": "IB Gateway responded but authentication is not established."
+        }
+    status_data = status_response.json()
+
+    accounts = []
+    accounts_url = f"{gateway_url}/v1/api/iserver/accounts"
+    accounts_response = session.get(accounts_url)
+    if accounts_response.status_code == 200:
+        accounts_payload = accounts_response.json()
+        if isinstance(accounts_payload, dict) and "accounts" in accounts_payload:
+            accounts = accounts_payload.get("accounts", [])
+        elif isinstance(accounts_payload, list):
+            accounts = accounts_payload
+        else:
+            accounts = [accounts_payload]
+
+    status_data["accounts"] = accounts
+    return status_data
+
+def fetch_company_name_for_conid(session, gateway_url, conid):
+    """
+    Best-effort company name lookup for a contract id (conid).
+    Cached in session_state to avoid repeated calls.
+    """
+    cache = st.session_state.setdefault("ib_company_cache", {})
+    if conid in cache:
+        return cache[conid]
+
+    info_url = f"{gateway_url}/v1/api/iserver/contract/{conid}/info"
+    response = session.get(info_url)
+    if response.status_code != 200:
+        cache[conid] = None
+        return None
+
+    payload = response.json()
+    items = payload if isinstance(payload, list) else [payload]
+    company_name = None
+    for item in items:
+        company_name = item.get("company_name") or item.get("companyName")
+        if company_name:
+            break
+
+    cache[conid] = company_name
+    return company_name
+
+def fetch_contract_metadata(session, gateway_url, conid):
+    """
+    Fetch contract metadata (instrument_type, trading_class) for a conid.
+    Cached in session_state to avoid repeated calls.
+    """
+    cache = st.session_state.setdefault("ib_contract_cache", {})
+    if conid in cache:
+        return cache[conid]
+
+    info_url = f"{gateway_url}/v1/api/iserver/contract/{conid}/info"
+    response = session.get(info_url)
+    if response.status_code != 200:
+        cache[conid] = {}
+        return {}
+
+    payload = response.json()
+    item = payload[0] if isinstance(payload, list) and payload else payload
+    metadata = {
+        "instrument_type": item.get("instrument_type"),
+        "trading_class": item.get("trading_class")
+    }
+    cache[conid] = metadata
+    return metadata
+
+def fetch_exchange_for_conid(session, gateway_url, conid):
+    """
+    Best-effort exchange lookup for a contract id (conid).
+    Cached in session_state to avoid repeated calls.
+    """
+    cache = st.session_state.setdefault("ib_exchange_cache", {})
+    if conid in cache:
+        return cache[conid]
+
+    exchange = None
+    info_url = f"{gateway_url}/v1/api/iserver/contract/{conid}/info"
+    response = session.get(info_url)
+    if response.status_code == 200:
+        payload = response.json()
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            exchange = item.get("listingExchange") or item.get("exchange")
+            if exchange:
+                break
+            exchanges = item.get("exchanges") or item.get("validExchanges")
+            if isinstance(exchanges, str) and exchanges.strip():
+                exchange = exchanges.split(",")[0]
+                break
+
+    if not exchange:
+        secdef_url = f"{gateway_url}/v1/api/iserver/secdef/info"
+        secdef_response = session.get(secdef_url, params={"conid": conid})
+        if secdef_response.status_code == 200:
+            payload = secdef_response.json()
+            items = payload if isinstance(payload, list) else [payload]
+            for item in items:
+                exchange = item.get("listingExchange") or item.get("exchange")
+                if exchange:
+                    break
+                exchanges = item.get("exchanges") or item.get("validExchanges")
+                if isinstance(exchanges, str) and exchanges.strip():
+                    exchange = exchanges.split(",")[0]
+                    break
+
+    cache[conid] = exchange
+    return exchange
+
+def fetch_fx_rate(session, gateway_url, base_currency, quote_currency):
+    """
+    Attempt to fetch FX rate using IB exchange rate endpoint.
+    Returns float rate if available, otherwise None.
+    """
+    if base_currency == quote_currency:
+        return 1.0
+    cache = st.session_state.setdefault("ib_fx_cache", {})
+    cache_key = (base_currency, quote_currency)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    rate_url = f"{gateway_url}/v1/api/iserver/exchangerate"
+    response = session.get(rate_url, params={"source": base_currency, "target": quote_currency})
+    if response.status_code != 200:
+        return None
+    payload = response.json()
+    try:
+        rate = float(payload.get("rate"))
+    except (TypeError, ValueError):
+        return None
+
+    cache[cache_key] = rate
+    return rate
 
 #######################################################
 # Combined Portfolio Functions
@@ -594,7 +918,11 @@ def combine_portfolio_data(schwab_data, ib_data):
             "market_value": position["market_value"],
             "cost_basis": position["cost_basis"],
             "unrealized_pl": position["unrealized_pl"],
-            "unrealized_pl_percent": position["unrealized_pl_percent"]
+            "unrealized_pl_percent": position["unrealized_pl_percent"],
+            "currency": position.get("currency"),
+            "conid": position.get("conid"),
+            "exchange": position.get("exchange"),
+            "asset_class": position.get("asset_class")
         })
         
         # Update allocation by symbol
@@ -617,7 +945,7 @@ def combine_portfolio_data(schwab_data, ib_data):
 # Dashboard Display Functions
 #######################################################
 
-def display_portfolio_summary(combined_data, view_type="all"):
+def display_portfolio_summary(combined_data, view_type="all", display_currency="GBP"):
     """
     Display portfolio summary based on the selected view type
     
@@ -633,9 +961,32 @@ def display_portfolio_summary(combined_data, view_type="all"):
     filtered_data = filter_portfolio_data(combined_data, view_type)
     
     # Check if there's data to display
-    if filtered_data["total_value"] == 0:
-        st.info(f"No data available for the selected view: {view_type}")
+    if not filtered_data["accounts"] and not filtered_data["positions"]:
+        st.info("No data available for the selected view.")
         return
+
+    # Currency conversion is required before aggregating values across positions.
+    # Always convert to the display currency first, then sum totals and allocations.
+    gateway_url = st.session_state.get("ib_gateway_url")
+    session = st.session_state.get("ib_session")
+    if session is None:
+        session = requests.Session()
+        session.verify = False
+
+    currencies = sorted({
+        pos.get("currency") for pos in filtered_data["positions"]
+        if isinstance(pos, dict) and pos.get("currency")
+    })
+    fx_rates = {}
+    fx_rates_gbp = {}
+    if gateway_url and session:
+        for currency in currencies:
+            if currency != display_currency:
+                rate = fetch_fx_rate(session, gateway_url, display_currency, currency)
+                fx_rates[(display_currency, currency)] = rate
+            if currency != "GBP":
+                rate_gbp = fetch_fx_rate(session, gateway_url, "GBP", currency)
+                fx_rates_gbp[("GBP", currency)] = rate_gbp
     
     # Display total portfolio value
     st.subheader("Total Portfolio Value")
@@ -643,7 +994,40 @@ def display_portfolio_summary(combined_data, view_type="all"):
     
     # Use st.metric to display the value
     # In a real app, you would calculate the change values for the third parameter
-    st.metric("Portfolio Value", f"${total_value:,.2f}", "")
+    display_total_value = 0
+    broker_totals = {}
+    account_totals = {}
+    for position in filtered_data["positions"]:
+        base_currency = position.get("currency")
+        currency_for_fx = base_currency or display_currency
+        rate = fx_rates.get((display_currency, currency_for_fx), 1.0 if currency_for_fx == display_currency else None)
+        gbp_rate = fx_rates_gbp.get(("GBP", base_currency), 1.0 if base_currency == "GBP" else None)
+        converted_value = None
+        gbp_value = None
+        if rate:
+            converted_value = position.get("market_value", 0) / rate
+            display_total_value += converted_value
+
+            broker = position.get("broker", "Unknown")
+            broker_totals[broker] = broker_totals.get(broker, 0) + converted_value
+
+            account_id = position.get("account_id", "Unknown")
+            account_totals[account_id] = account_totals.get(account_id, 0) + converted_value
+        if gbp_rate:
+            gbp_value = position.get("market_value", 0) / gbp_rate
+
+        position["base_currency"] = base_currency or "Unknown"
+        position["fx_rate"] = rate
+        position["converted_value"] = converted_value
+        position["gbp_rate"] = gbp_rate
+        position["gbp_value"] = gbp_value
+        position["gbp_unrealized_pl"] = (
+            position.get("unrealized_pl", 0) / gbp_rate if gbp_rate else None
+        )
+
+    total_value = display_total_value
+    currency_symbol = "£" if display_currency == "GBP" else "$"
+    st.metric("Portfolio Value", f"{currency_symbol}{total_value:,.2f}", "")
     
     # Create a row with three columns for summary metrics
     # st.columns creates a layout with the specified number of equal-width columns
@@ -659,7 +1043,7 @@ def display_portfolio_summary(combined_data, view_type="all"):
     with col1:
         st.metric("Number of Positions", f"{num_positions}", "")
     with col2:
-        st.metric("Average Position Size", f"${avg_position_value:,.2f}", "")
+        st.metric("Average Position Size", f"{avg_position_value:,.2f}", "")
     with col3:
         # This would be calculated from historical data in a real app
         st.metric("YTD Return", "+7.2%", "")
@@ -670,7 +1054,7 @@ def display_portfolio_summary(combined_data, view_type="all"):
         
         # Calculate percentages for each broker
         broker_data = []
-        for broker, value in filtered_data["brokers"].items():
+        for broker, value in broker_totals.items():
             # Calculate percentage of total, avoiding division by zero
             if total_value > 0:
                 percentage = (value / total_value) * 100
@@ -716,7 +1100,8 @@ def display_portfolio_summary(combined_data, view_type="all"):
     for account in filtered_data["accounts"]:
         # Calculate percentage of total, avoiding division by zero
         if total_value > 0:
-            percentage = (account["value"] / total_value) * 100
+            value = account_totals.get(account["account_id"], account["value"])
+            percentage = (value / total_value) * 100
         else:
             percentage = 0
             
@@ -725,7 +1110,8 @@ def display_portfolio_summary(combined_data, view_type="all"):
             "Broker": account["broker"],
             "Account": account["account_name"],
             "Type": account["account_type"],
-            "Value": account["value"],
+            f"Value ({display_currency})": account_totals.get(account["account_id"], account["value"]),
+            "Account Currency": account.get("currency", "Unknown"),
             "Percentage": percentage
         })
     
@@ -735,7 +1121,9 @@ def display_portfolio_summary(combined_data, view_type="all"):
     
     # Format the Value column as currency
     # The map function applies a format to each value in the column
-    df_accounts["Value"] = df_accounts["Value"].map("${:,.2f}".format)
+    df_accounts[f"Value ({display_currency})"] = df_accounts[f"Value ({display_currency})"].map(
+        lambda v: f"{currency_symbol}{v:,.2f}" if isinstance(v, (int, float)) else v
+    )
     
     # Format the Percentage column with one decimal place
     df_accounts["Percentage"] = df_accounts["Percentage"].map("{:.1f}%".format)
@@ -750,10 +1138,23 @@ def display_portfolio_summary(combined_data, view_type="all"):
     
     # Prepare allocation data for pie chart
     allocation_data = []
-    for symbol, data in filtered_data["allocation"].items():
+    allocation_map = {}
+    total_gbp = 0
+    for position in filtered_data["positions"]:
+        symbol = position.get("symbol", "Unknown")
+        if symbol not in allocation_map:
+            allocation_map[symbol] = {
+                "total_value": 0,
+                "description": position.get("description", "Unknown")
+            }
+        if position.get("gbp_value") is not None:
+            allocation_map[symbol]["total_value"] += position["gbp_value"]
+            total_gbp += position["gbp_value"]
+
+    for symbol, data in allocation_map.items():
         # Calculate percentage of total, avoiding division by zero
-        if total_value > 0:
-            percentage = (data["total_value"] / total_value) * 100
+        if total_gbp > 0:
+            percentage = (data["total_value"] / total_gbp) * 100
         else:
             percentage = 0
             
@@ -762,7 +1163,7 @@ def display_portfolio_summary(combined_data, view_type="all"):
             "Symbol": symbol,
             "Description": data["description"],
             "Value": data["total_value"],
-            "Percentage": percentage
+        "Percentage": percentage
         })
     
     # Sort by value descending
@@ -781,7 +1182,7 @@ def display_portfolio_summary(combined_data, view_type="all"):
         names="Symbol", 
         title="Portfolio Allocation by Security",
         hover_data=["Description", "Percentage"],
-        labels={"Value": "Market Value"}
+        labels={"Value": "Market Value (GBP)"}
     )
     
     # Configure the pie chart to show percentages and labels
@@ -789,42 +1190,164 @@ def display_portfolio_summary(combined_data, view_type="all"):
     
     # Display the chart in the Streamlit app
     st.plotly_chart(fig)
+
+    # Display allocation by asset class
+    st.subheader("Portfolio Allocation by Asset Class")
+    class_allocation = {}
+    total_gbp_value = 0
+    for position in filtered_data["positions"]:
+        gbp_value = position.get("gbp_value")
+        if gbp_value is None:
+            continue
+        total_gbp_value += gbp_value
+        asset_class = position.get("asset_class", "Other")
+        conid = position.get("conid")
+        if conid and gateway_url and session:
+            metadata = fetch_contract_metadata(session, gateway_url, conid)
+            if metadata.get("instrument_type") == "STK" and metadata.get("trading_class") == "EUET":
+                asset_class = "Equity ETFs"
+            elif metadata.get("instrument_type") == "FUND":
+                asset_class = "Money Market Funds"
+        if position.get("symbol") == "CASH":
+            asset_class = "Cash"
+        class_allocation[asset_class] = class_allocation.get(asset_class, 0) + gbp_value
+
+    class_rows = []
+    for asset_class, value in class_allocation.items():
+        percentage = (value / total_gbp_value * 100) if total_gbp_value else 0
+        class_rows.append({
+            "Asset Class": asset_class,
+            "Value": value,
+            "Percentage": percentage
+        })
+
+    if class_rows:
+        df_class = pd.DataFrame(class_rows)
+        fig_class = px.pie(
+            df_class,
+            values="Value",
+            names="Asset Class",
+            title="Portfolio Allocation by Asset Class",
+            hover_data=["Percentage"],
+            labels={"Value": "Market Value (GBP)"}
+        )
+        fig_class.update_traces(textinfo="percent+label")
+        st.plotly_chart(fig_class)
     
     # Display positions table
     st.subheader("Positions")
     
     # Prepare positions data for display
     positions_data = []
+    def get_exchange(position):
+        exchs = position.get("exchs")
+        if isinstance(exchs, str) and exchs.strip():
+            return exchs
+        if isinstance(exchs, list) and exchs:
+            return ",".join(exchs)
+        con_exch_map = position.get("conExchMap")
+        if isinstance(con_exch_map, list) and con_exch_map:
+            first = con_exch_map[0]
+            if isinstance(first, dict):
+                return first.get("exch") or first.get("exchange") or first.get("name")
+        return position.get("listingExchange") or position.get("exchange")
+
+    def get_exchange(position):
+        exchange = position.get("exchange")
+        if isinstance(exchange, str) and exchange.strip():
+            return exchange
+        exchs = position.get("exchs")
+        if isinstance(exchs, str) and exchs.strip():
+            return exchs
+        if isinstance(exchs, list) and exchs:
+            return ",".join(exchs)
+        con_exch_map = position.get("conExchMap")
+        if isinstance(con_exch_map, list) and con_exch_map:
+            first = con_exch_map[0]
+            if isinstance(first, dict):
+                return first.get("exch") or first.get("exchange") or first.get("name")
+        conid = position.get("conid")
+        if conid and gateway_url and session:
+            return fetch_exchange_for_conid(session, gateway_url, conid)
+        return position.get("listingExchange")
+
+    converted_label = "Market Value (GBP)"
+    converted_pnl_label = "Unrealized P&L (GBP)"
+    market_value_base_label = "Market Value (Base)"
+    cost_basis_base_label = "Cost Basis (Base)"
+    unrealized_base_label = "Unrealized P&L (Base)"
     for position in filtered_data["positions"]:
-        # Add position data to list for display
+        description = position.get("description")
+        conid = position.get("conid")
+        if conid and gateway_url and session:
+            company_name = fetch_company_name_for_conid(session, gateway_url, conid)
+            if company_name:
+                description = company_name
+        asset_class = position.get("asset_class", "Other")
+        if conid and gateway_url and session:
+            metadata = fetch_contract_metadata(session, gateway_url, conid)
+            if metadata.get("instrument_type") == "STK" and metadata.get("trading_class") == "EUET":
+                asset_class = "Equity ETFs"
+            elif metadata.get("instrument_type") == "FUND":
+                asset_class = "Money Market Funds"
+        if position.get("symbol") == "CASH":
+            asset_class = "Cash"
+        gbp_value = position.get("gbp_value")
+        total_gbp_value = total_gbp if total_gbp else None
+        percent_portfolio = (gbp_value / total_gbp_value * 100) if gbp_value is not None and total_gbp_value else None
         positions_data.append({
             "Broker": position["broker"],
-            "Account": position["account_id"],
             "Symbol": position["symbol"],
-            "Description": position["description"],
+            "Description": description,
+            "Asset Class": asset_class,
             "Quantity": position["quantity"],
-            "Market Value": position["market_value"],
-            "Cost Basis": position["cost_basis"],
-            "Unrealized P/L": position["unrealized_pl"],
-            "% P/L": position["unrealized_pl_percent"]
+            market_value_base_label: position["market_value"],
+            "Base Currency": position.get("base_currency"),
+            "FX Rate": position.get("gbp_rate"),
+            converted_label: position.get("gbp_value"),
+            "% Portfolio (GBP)": percent_portfolio,
+            "Unrealized P&L (%)": position["unrealized_pl_percent"],
+            cost_basis_base_label: position["cost_basis"],
+            unrealized_base_label: position["unrealized_pl"],
+            converted_pnl_label: position.get("gbp_unrealized_pl")
         })
     
     # Convert to DataFrame and sort by Market Value descending
     df_positions = pd.DataFrame(positions_data)
     # The sort_values method sorts a DataFrame in place
-    # by="Market Value" means sort by the "Market Value" column
+    # by="Market Value (Base)" means sort by the "Market Value (Base)" column
     # ascending=False means sort in descending order
-    df_positions = df_positions.sort_values(by="Market Value", ascending=False)
+    df_positions = df_positions.sort_values(by=market_value_base_label, ascending=False)
     
     # Format numeric columns
-    # Format Market Value as currency
-    df_positions["Market Value"] = df_positions["Market Value"].map("${:,.2f}".format)
-    # Format Cost Basis as currency
-    df_positions["Cost Basis"] = df_positions["Cost Basis"].map("${:,.2f}".format)
-    # Format Unrealized P/L as currency
-    df_positions["Unrealized P/L"] = df_positions["Unrealized P/L"].map("${:,.2f}".format)
+    df_positions[market_value_base_label] = df_positions[market_value_base_label].map(
+        lambda v: round(v, 2) if isinstance(v, (int, float)) else v
+    )
+    df_positions[cost_basis_base_label] = df_positions[cost_basis_base_label].map(
+        lambda v: round(v, 2) if isinstance(v, (int, float)) else v
+    )
+    df_positions[unrealized_base_label] = df_positions[unrealized_base_label].map(
+        lambda v: round(v, 2) if isinstance(v, (int, float)) else v
+    )
+    if converted_label in df_positions.columns:
+        df_positions[converted_label] = df_positions[converted_label].map(
+            lambda v: round(v, 2) if isinstance(v, (int, float)) else None
+        )
+    if "% Portfolio (GBP)" in df_positions.columns:
+        df_positions["% Portfolio (GBP)"] = df_positions["% Portfolio (GBP)"].map(
+            lambda v: f"{v:.2f}%" if isinstance(v, (int, float)) else None
+        )
+    if converted_pnl_label in df_positions.columns:
+        df_positions[converted_pnl_label] = df_positions[converted_pnl_label].map(
+            lambda v: round(v, 2) if isinstance(v, (int, float)) else None
+        )
+    if "FX Rate" in df_positions.columns:
+        df_positions["FX Rate"] = df_positions["FX Rate"].map(
+            lambda v: round(v, 6) if isinstance(v, (int, float)) else None
+        )
     # Format % P/L with two decimal places
-    df_positions["% P/L"] = df_positions["% P/L"].map("{:.2f}%".format)
+    if "Unrealized P&L (%)" in df_positions.columns:
+        df_positions["Unrealized P&L (%)"] = df_positions["Unrealized P&L (%)"].map("{:.2f}%".format)
     
     # Display positions table
     st.dataframe(df_positions, use_container_width=True)
@@ -1075,6 +1598,7 @@ with tab2:
     
     # Interactive Brokers Authentication section
     st.subheader("Interactive Brokers")
+
     
     # Check if we're already connected to Interactive Brokers
     if "ib_connected" in st.session_state and st.session_state["ib_connected"]:
@@ -1094,24 +1618,7 @@ with tab2:
             st.experimental_rerun()
     else:
         # If not connected, show instructions
-        st.info("To connect to Interactive Brokers, you need to set up the IB API Gateway.")
-        
-        # Create an expandable section with more details
-        # st.expander creates a section that can be expanded/collapsed
-        with st.expander("Interactive Brokers Setup Instructions"):
-            # Display instructions for setting up IB connection
-            st.write("""
-            1. Download and install the IB API Gateway from the Interactive Brokers website
-            2. Configure the gateway with your account credentials
-            3. Start the gateway and ensure it's running on port 4001
-            4. Add your IB credentials to your .env file:
-               ```
-               IB_CLIENT_ID=1
-               IB_GATEWAY_PORT=4001
-               IB_HOST=127.0.0.1
-               ```
-            5. Click the Connect button below
-            """)
+        st.info("To connect to Interactive Brokers, you need to set up the IB API Gateway. See the Help tab for setup steps.")
         
         # Add a button to connect
         if st.button("Connect to Interactive Brokers"):
@@ -1131,9 +1638,104 @@ with tab2:
                 # If connection failed, show error
                 st.error("Failed to connect to Interactive Brokers. Check your credentials and make sure the IB Gateway is running.")
 
+    # Server status panel (generic)
+    with st.expander("Server Status", expanded=True):
+        st.subheader("Interactive Brokers")
+        if "ib_connected" in st.session_state and st.session_state["ib_connected"]:
+            ib_status = get_ib_status()
+            if ib_status is None:
+                st.warning("IB Gateway is not reachable. Make sure it is running.")
+            else:
+                auth_state = ib_status.get("authenticated", False)
+                conn_state = ib_status.get("connected", False)
+                st.write(f"Authenticated: {auth_state}")
+                st.write(f"Connected: {conn_state}")
+                server_info = ib_status.get("serverInfo", {})
+                if server_info:
+                    st.write(f"Server Version: {server_info.get('serverVersion', 'Unknown')}")
+                    st.write(f"Server Name: {server_info.get('serverName', 'Unknown')}")
+
+                accounts = ib_status.get("accounts", [])
+                if accounts:
+                    redacted_accounts = []
+                    for account in accounts:
+                        account_id = account.get("accountId") if isinstance(account, dict) else str(account)
+                        if account_id:
+                            redacted_accounts.append(f"{account_id[:3]}***{account_id[-2:]}")
+                    if redacted_accounts:
+                        st.write(f"Accounts: {', '.join(redacted_accounts)}")
+
+                last_fetch = st.session_state.get("ib_last_fetch")
+                if last_fetch:
+                    st.write(f"Last Data Update: {last_fetch}")
+                account_count = st.session_state.get("ib_last_account_count")
+                position_count = st.session_state.get("ib_last_position_count")
+                if account_count is not None:
+                    st.write(f"Accounts Fetched: {account_count}")
+                if position_count is not None:
+                    st.write(f"Positions Fetched: {position_count}")
+                currencies = st.session_state.get("ib_last_currencies")
+                if currencies:
+                    st.write(f"Currencies Seen: {', '.join(currencies)}")
+        else:
+            st.info("Connect to Interactive Brokers to view server status.")
+
+        st.subheader("Charles Schwab")
+        if "schwab_token" in st.session_state:
+            st.write("Authenticated: True")
+            last_fetch = st.session_state.get("schwab_last_fetch")
+            if last_fetch:
+                st.write(f"Last Data Update: {last_fetch}")
+        else:
+            st.write("Authenticated: False")
+
 # Portfolio Summary tab
 with tab1:
     st.header("Portfolio Summary")
+
+    display_currency = st.sidebar.radio(
+        "Display currency",
+        ["GBP", "USD"],
+        index=0
+    )
+    view_option = st.sidebar.radio(
+        "Select view",
+        ["All Accounts", "Schwab Only", "Interactive Brokers ISA Only"]
+    )
+
+    snapshots = st.session_state.get("portfolio_snapshots", [])
+    latest_snapshot = snapshots[-1] if snapshots else None
+    is_stale = False
+    if latest_snapshot and latest_snapshot.get("timestamp"):
+        try:
+            last_time = datetime.fromisoformat(latest_snapshot["timestamp"])
+            age_minutes = (datetime.now() - last_time).total_seconds() / 60
+            is_stale = age_minutes >= 30
+        except ValueError:
+            is_stale = False
+
+    if st.sidebar.button("Refresh data", type="primary" if is_stale else "secondary"):
+        st.session_state["force_refresh"] = True
+        st.experimental_rerun()
+
+    if is_stale:
+        st.sidebar.caption("Data is stale (30+ minutes). Click Refresh data to update.")
+    else:
+        st.sidebar.caption("Data refreshes on page load. Use the button to pull the latest snapshot.")
+
+    if is_stale:
+        st.markdown(
+            """
+            <style>
+            button[kind="primary"] {
+                background-color: #2e7d32 !important;
+                border: 1px solid #1b5e20 !important;
+                color: #ffffff !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
     
     # Initialize combined data as None
     combined_data = None
@@ -1174,13 +1776,6 @@ with tab1:
         # Combine the data into a single portfolio view
         combined_data = combine_portfolio_data(schwab_data, ib_data)
         
-        # Let the user choose which view to display
-        view_option = st.radio(
-            "Select view:",
-            ["All Accounts", "Schwab Only", "Interactive Brokers ISA Only"],
-            horizontal=True
-        )
-        
         # Map the selected option to the view_type parameter
         view_mapping = {
             "All Accounts": "all",
@@ -1189,7 +1784,20 @@ with tab1:
         }
         
         # Display the portfolio summary with the selected view type
-        display_portfolio_summary(combined_data, view_mapping[view_option])
+        display_portfolio_summary(combined_data, view_mapping[view_option], display_currency=display_currency)
+
+        snapshot = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "display_currency": display_currency,
+            "accounts": len(combined_data.get("accounts", [])),
+            "positions": len(combined_data.get("positions", [])),
+            "total_value": combined_data.get("total_value", 0),
+            "ib_last_fetch": st.session_state.get("ib_last_fetch"),
+            "schwab_last_fetch": st.session_state.get("schwab_last_fetch")
+        }
+        snapshots = st.session_state.get("portfolio_snapshots", [])
+        snapshots.append(snapshot)
+        st.session_state["portfolio_snapshots"] = snapshots[-5:]
         
     else:
         # If no data is available, show instructions
@@ -1198,6 +1806,21 @@ with tab1:
         # Show example dashboard if user wants to see a preview
         if st.button("Show Example Dashboard"):
             display_example_dashboard()
+
+    st.subheader("Portfolio Data Snapshots")
+    snapshots = st.session_state.get("portfolio_snapshots", [])
+    if snapshots:
+        latest = snapshots[-1]
+        try:
+            last_time = datetime.fromisoformat(latest["timestamp"])
+            age_minutes = (datetime.now() - last_time).total_seconds() / 60
+            if age_minutes >= 30:
+                st.warning("Portfolio data is stale (30+ minutes). Click Refresh data for the latest.")
+        except ValueError:
+            pass
+        st.dataframe(pd.DataFrame(snapshots[::-1]), use_container_width=True)
+    else:
+        st.info("No snapshots yet. Refresh data to create a snapshot.")
 
 # Settings tab
 with tab3:
@@ -1277,6 +1900,20 @@ with tab4:
     
     # API Connection Help section
     st.subheader("API Connection Help")
+
+    # Create an expandable section for IB setup instructions
+    with st.expander("Interactive Brokers Setup Instructions"):
+        st.write("""
+        1. Download and install the IB API Gateway from the Interactive Brokers website
+        2. Configure the gateway with your account credentials
+        3. Start the gateway and ensure it's running on port 5001
+        4. Add your IB settings to your .env file:
+           ```
+           IB_GATEWAY_PORT=5001
+           IB_HOST=127.0.0.1
+           ```
+        5. Click "Connect to Interactive Brokers" in the Authentication tab
+        """)
     
     # Create an expandable section for Schwab connection issues
     with st.expander("Charles Schwab Connection Issues"):
@@ -1304,7 +1941,7 @@ with tab4:
         
         1. Install the IB API Gateway
         2. Configure it with your IB account credentials
-        3. Start the gateway and ensure it's running on port 4001
+        3. Start the gateway and ensure it's running on port 5001
         4. Add your IB credentials to the .env file
         5. Click "Connect to Interactive Brokers" in the Authentication tab
         

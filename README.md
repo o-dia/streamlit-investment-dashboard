@@ -34,12 +34,17 @@ the relevant brokerage and make sure their APIs support what you need.
    cd streamlit-investment-dashboard
    ```
 
-2. Install dependencies:
+2. Create and activate your conda environment:
+   ```
+   conda activate streamlit-dashboard
+   ```
+
+3. Install dependencies:
    ```
    pip install -r requirements.txt
    ```
 
-3. Create a `.env` file with your credentials:
+4. Create a `.env` file with your credentials:
    ```
    SCHWAB_CLIENT_ID=your_client_id_here
    SCHWAB_CLIENT_SECRET=your_client_secret_here
@@ -51,23 +56,41 @@ the relevant brokerage and make sure their APIs support what you need.
    IB_HOST=127.0.0.1
    ```
 
-## Usage
+## Usage (Local)
 
-1. Start ngrok to create a tunnel for OAuth:
+1. (Optional, Schwab) Start ngrok to create a tunnel for OAuth:
    ```
    ngrok http 8501
    ```
 
-2. Update your `.env` file with the ngrok URL
+2. (Optional, Schwab) Update your `.env` file with the ngrok URL
+   - ngrok URLs change each time you run it; update both `.env` and the Schwab developer portal redirect URL to match.
 
-3. Run the app:
+3. (IB) Start the Interactive Brokers Client Portal API Gateway and log in.
+
+4. Run the app:
    ```
    streamlit run app.py
    ```
 
-4. Open your browser to http://localhost:8501
+5. Open your browser to http://localhost:8501
 
-5. Navigate to the Authentication tab to connect your brokerage accounts
+6. Navigate to the Authentication tab to connect your brokerage accounts
+
+## Step-by-Step Terminal Commands (Local)
+
+```
+cd /Users/Omar/Coding/Python/Streamlit
+conda activate streamlit-dashboard
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Edit `.env` with your credentials, then run:
+
+```
+streamlit run app.py
+```
 
 ## Development Status
 
