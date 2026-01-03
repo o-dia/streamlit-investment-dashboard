@@ -358,6 +358,7 @@ def get_ib_account_data():
 
     try:
         st.session_state["ib_last_fetch"] = datetime.now().isoformat()
+        st.session_state.setdefault("data_source_timestamps", {})["IB Portfolio Data"] = datetime.now().isoformat(timespec="seconds")
         # Structure to hold our account data
         account_data = {
             "account_summary": {},
@@ -723,6 +724,7 @@ def fetch_company_name_for_conid(session, gateway_url, conid):
             break
 
     cache[conid] = company_name
+    st.session_state.setdefault("data_source_timestamps", {})["IB Contract Metadata"] = datetime.now().isoformat(timespec="seconds")
     return company_name
 
 def fetch_contract_metadata(session, gateway_url, conid):
@@ -747,6 +749,7 @@ def fetch_contract_metadata(session, gateway_url, conid):
         "trading_class": item.get("trading_class")
     }
     cache[conid] = metadata
+    st.session_state.setdefault("data_source_timestamps", {})["IB Contract Metadata"] = datetime.now().isoformat(timespec="seconds")
     return metadata
 
 def fetch_exchange_for_conid(session, gateway_url, conid):
@@ -789,6 +792,7 @@ def fetch_exchange_for_conid(session, gateway_url, conid):
                     break
 
     cache[conid] = exchange
+    st.session_state.setdefault("data_source_timestamps", {})["IB Contract Metadata"] = datetime.now().isoformat(timespec="seconds")
     return exchange
 
 def fetch_fx_rate(session, gateway_url, base_currency, quote_currency):
@@ -814,6 +818,7 @@ def fetch_fx_rate(session, gateway_url, base_currency, quote_currency):
         return None
 
     cache[cache_key] = rate
+    st.session_state.setdefault("data_source_timestamps", {})["IB FX Rates"] = datetime.now().isoformat(timespec="seconds")
     return rate
 
 #######################################################
@@ -1046,7 +1051,7 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         st.metric("Average Position Size", f"{avg_position_value:,.2f}", "")
     with col3:
         # This would be calculated from historical data in a real app
-        st.metric("YTD Return", "+7.2%", "")
+        st.metric("YTD Return", "N/A", "")
     
     # Display breakdown by broker if showing all accounts
     if view_type == "all":
@@ -1111,7 +1116,6 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
             "Account": account["account_name"],
             "Type": account["account_type"],
             f"Value ({display_currency})": account_totals.get(account["account_id"], account["value"]),
-            "Account Currency": account.get("currency", "Unknown"),
             "Percentage": percentage
         })
     
@@ -1122,7 +1126,7 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # Format the Value column as currency
     # The map function applies a format to each value in the column
     df_accounts[f"Value ({display_currency})"] = df_accounts[f"Value ({display_currency})"].map(
-        lambda v: f"{currency_symbol}{v:,.2f}" if isinstance(v, (int, float)) else v
+        lambda v: round(v, 2) if isinstance(v, (int, float)) else v
     )
     
     # Format the Percentage column with one decimal place
@@ -1715,8 +1719,13 @@ with tab1:
             is_stale = False
 
     if st.sidebar.button("Refresh data", type="primary" if is_stale else "secondary"):
-        st.session_state["force_refresh"] = True
+        st.session_state["refresh_requested"] = True
         st.experimental_rerun()
+
+    if st.session_state.pop("refresh_requested", False):
+        st.session_state.pop("ib_fx_cache", None)
+        st.session_state.pop("ib_company_cache", None)
+        st.session_state.pop("ib_contract_cache", None)
 
     if is_stale:
         st.sidebar.caption("Data is stale (30+ minutes). Click Refresh data to update.")
@@ -1786,19 +1795,6 @@ with tab1:
         # Display the portfolio summary with the selected view type
         display_portfolio_summary(combined_data, view_mapping[view_option], display_currency=display_currency)
 
-        snapshot = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "display_currency": display_currency,
-            "accounts": len(combined_data.get("accounts", [])),
-            "positions": len(combined_data.get("positions", [])),
-            "total_value": combined_data.get("total_value", 0),
-            "ib_last_fetch": st.session_state.get("ib_last_fetch"),
-            "schwab_last_fetch": st.session_state.get("schwab_last_fetch")
-        }
-        snapshots = st.session_state.get("portfolio_snapshots", [])
-        snapshots.append(snapshot)
-        st.session_state["portfolio_snapshots"] = snapshots[-5:]
-        
     else:
         # If no data is available, show instructions
         st.info("Please connect at least one brokerage account in the Authentication tab.")
@@ -1807,20 +1803,16 @@ with tab1:
         if st.button("Show Example Dashboard"):
             display_example_dashboard()
 
-    st.subheader("Portfolio Data Snapshots")
-    snapshots = st.session_state.get("portfolio_snapshots", [])
-    if snapshots:
-        latest = snapshots[-1]
-        try:
-            last_time = datetime.fromisoformat(latest["timestamp"])
-            age_minutes = (datetime.now() - last_time).total_seconds() / 60
-            if age_minutes >= 30:
-                st.warning("Portfolio data is stale (30+ minutes). Click Refresh data for the latest.")
-        except ValueError:
-            pass
-        st.dataframe(pd.DataFrame(snapshots[::-1]), use_container_width=True)
+    st.subheader("Portfolio Data Sources")
+    data_sources = st.session_state.get("data_source_timestamps", {})
+    data_sources.setdefault("IB Portfolio Data", "Not fetched")
+    data_sources.setdefault("IB FX Rates", "Not fetched")
+    data_sources.setdefault("IB Contract Metadata", "Not fetched")
+    if data_sources:
+        rows = [{"Data Source": key, "Last Updated": value} for key, value in data_sources.items()]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
-        st.info("No snapshots yet. Refresh data to create a snapshot.")
+        st.info("No data sources recorded yet. Refresh data to pull the latest feeds.")
 
 # Settings tab
 with tab3:
