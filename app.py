@@ -5,10 +5,13 @@ import numpy as np      # NumPy for numerical operations
 import time             # Time library for handling time-related tasks
 import requests         # Requests library for making HTTP requests to APIs
 import os               # OS module for interacting with the operating system
+import uuid             # UUIDs for snapshot runs
 import plotly.express as px          # Plotly Express for simple interactive plots
 import plotly.graph_objects as go     # Plotly Graph Objects for more complex plots
-from datetime import datetime         # DateTime for handling dates and times
+from datetime import datetime, timezone         # DateTime for handling dates and times
 from dotenv import load_dotenv        # dotenv for loading environment variables from .env file
+import psycopg                         # PostgreSQL driver
+from psycopg.types.json import Json    # JSON adapter for Postgres
 
 # Load environment variables from .env file
 # This function reads the .env file in your project directory
@@ -48,12 +51,297 @@ SCHWAB_REDIRECT_URI = os.getenv("SCHWAB_REDIRECT_URI", "https://your-ngrok-url.n
 IB_CLIENT_ID = os.getenv("IB_CLIENT_ID", "")  # Empty string default means no value
 IB_GATEWAY_PORT = os.getenv("IB_GATEWAY_PORT", "5001")  # Default port matches Client Portal Gateway
 IB_HOST = os.getenv("IB_HOST", "127.0.0.1")  # Default to localhost
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # API endpoints for Schwab services
 # These URLs are where our app will send requests to interact with Schwab's API
 SCHWAB_AUTH_URL = "https://api.schwabapi.com/v1/oauth/authorize"  # For user authorization
 SCHWAB_TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"     # For getting access tokens
 SCHWAB_ACCOUNTS_URL = "https://api.schwab.com/v2/accounts"        # For retrieving account data
+
+#######################################################
+# Database Persistence (manual snapshots)
+#######################################################
+
+def get_db_connection():
+    """
+    Create a Postgres connection using DATABASE_URL.
+    Returns (conn, error_message).
+    """
+    if not DATABASE_URL:
+        return None, "DATABASE_URL is not set. Add it to your .env file."
+    try:
+        return psycopg.connect(DATABASE_URL), None
+    except Exception as exc:
+        return None, f"Failed to connect to Postgres: {exc}"
+
+def ensure_snapshot_schema(conn):
+    """
+    Create the minimal schema for snapshot storage if it does not exist.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshot_runs (
+                run_id UUID PRIMARY KEY,
+                trigger_type TEXT NOT NULL,
+                started_at TIMESTAMPTZ NOT NULL,
+                finished_at TIMESTAMPTZ,
+                status TEXT NOT NULL,
+                error_summary TEXT
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id UUID PRIMARY KEY,
+                run_id UUID NOT NULL REFERENCES snapshot_runs(run_id),
+                broker TEXT NOT NULL,
+                broker_account_id TEXT NOT NULL,
+                asof_ts TIMESTAMPTZ NOT NULL,
+                snapshot_key TEXT NOT NULL UNIQUE,
+                total_value_local NUMERIC,
+                total_value_gbp NUMERIC,
+                base_currency TEXT DEFAULT 'GBP'
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS positions (
+                snapshot_id UUID NOT NULL REFERENCES snapshots(id),
+                broker TEXT NOT NULL,
+                broker_account_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                description TEXT,
+                quantity NUMERIC,
+                market_value_local NUMERIC,
+                market_value_gbp NUMERIC,
+                cost_basis NUMERIC,
+                unrealized_pl NUMERIC,
+                base_currency TEXT,
+                asset_class TEXT,
+                PRIMARY KEY (snapshot_id, broker, broker_account_id, symbol)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_payloads (
+                id UUID PRIMARY KEY,
+                run_id UUID NOT NULL REFERENCES snapshot_runs(run_id),
+                broker TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                payload_json JSONB NOT NULL,
+                received_at TIMESTAMPTZ NOT NULL
+            );
+            """
+        )
+    conn.commit()
+
+def parse_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        # Assume epoch seconds or milliseconds.
+        ts = float(value)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip().replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except ValueError:
+            return None
+    return None
+
+def find_timestamp_candidate(obj):
+    if isinstance(obj, dict):
+        for key in ("asOfDate", "asof", "asof_ts", "asOf", "timestamp", "time", "date"):
+            if key in obj and obj[key]:
+                return obj[key]
+    return None
+
+def get_broker_asof_ts(broker, raw_payload, account_id=None):
+    candidate = None
+    if broker == "Interactive Brokers" and raw_payload:
+        summary = raw_payload.get("account_summary", {}).get(str(account_id))
+        if isinstance(summary, dict):
+            candidate = find_timestamp_candidate(summary)
+        elif isinstance(summary, list):
+            for item in summary:
+                candidate = find_timestamp_candidate(item)
+                if candidate:
+                    break
+    elif broker == "Schwab" and raw_payload:
+        accounts = raw_payload.get("accounts", [])
+        for account in accounts:
+            if str(account.get("accountId")) == str(account_id):
+                candidate = find_timestamp_candidate(account) or find_timestamp_candidate(account.get("balances", {}))
+                break
+
+    parsed = parse_timestamp(candidate)
+    return parsed if parsed else datetime.now(timezone.utc)
+
+def store_snapshot_to_db(combined_data, raw_schwab_data, raw_ib_data):
+    conn, error = get_db_connection()
+    if error:
+        st.error(error)
+        return False
+
+    ensure_snapshot_schema(conn)
+    run_id = uuid.uuid4()
+    started_at = datetime.now(timezone.utc)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO snapshot_runs (run_id, trigger_type, started_at, status)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (run_id, "manual", started_at, "running")
+            )
+
+            received_at = datetime.now(timezone.utc)
+            if raw_schwab_data:
+                cur.execute(
+                    """
+                    INSERT INTO raw_payloads (id, run_id, broker, endpoint, payload_json, received_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (uuid.uuid4(), run_id, "Schwab", "accounts", Json(raw_schwab_data), received_at)
+                )
+            if raw_ib_data:
+                cur.execute(
+                    """
+                    INSERT INTO raw_payloads (id, run_id, broker, endpoint, payload_json, received_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (uuid.uuid4(), run_id, "Interactive Brokers", "portfolio", Json(raw_ib_data), received_at)
+                )
+
+            gateway_url = st.session_state.get("ib_gateway_url")
+            session = st.session_state.get("ib_session")
+            if session is None:
+                session = requests.Session()
+                session.verify = False
+
+            snapshot_ids = {}
+            for account in combined_data.get("accounts", []):
+                broker = account.get("broker", "Unknown")
+                account_id = account.get("account_id", "Unknown")
+                asof_ts = get_broker_asof_ts(
+                    broker,
+                    raw_ib_data if broker == "Interactive Brokers" else raw_schwab_data,
+                    account_id
+                )
+                snapshot_id = uuid.uuid4()
+                snapshot_key = f"{run_id}:{broker}:{account_id}:{asof_ts.isoformat()}"
+                total_value_local = account.get("value")
+                base_currency = account.get("currency")
+                total_value_gbp = None
+                if base_currency and gateway_url and session:
+                    rate = fetch_fx_rate(session, gateway_url, "GBP", base_currency)
+                    if rate and total_value_local is not None:
+                        total_value_gbp = total_value_local / rate
+
+                cur.execute(
+                    """
+                    INSERT INTO snapshots (
+                        id, run_id, broker, broker_account_id, asof_ts, snapshot_key,
+                        total_value_local, total_value_gbp, base_currency
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        snapshot_id,
+                        run_id,
+                        broker,
+                        account_id,
+                        asof_ts,
+                        snapshot_key,
+                        total_value_local,
+                        total_value_gbp,
+                        base_currency or "GBP"
+                    )
+                )
+                snapshot_ids[(broker, account_id)] = snapshot_id
+
+            for position in combined_data.get("positions", []):
+                broker = position.get("broker", "Unknown")
+                account_id = position.get("account_id", "Unknown")
+                snapshot_id = snapshot_ids.get((broker, account_id))
+                if not snapshot_id:
+                    continue
+
+                symbol = position.get("symbol") or "UNKNOWN"
+                base_currency = position.get("currency")
+                market_value = position.get("market_value")
+                market_value_gbp = None
+                if base_currency and gateway_url and session:
+                    rate = fetch_fx_rate(session, gateway_url, "GBP", base_currency)
+                    if rate:
+                        market_value_gbp = market_value / rate if market_value is not None else None
+
+                cur.execute(
+                    """
+                    INSERT INTO positions (
+                        snapshot_id, broker, broker_account_id, symbol, description, quantity,
+                        market_value_local, market_value_gbp, cost_basis, unrealized_pl,
+                        base_currency, asset_class
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (
+                        snapshot_id,
+                        broker,
+                        account_id,
+                        symbol,
+                        position.get("description"),
+                        position.get("quantity"),
+                        market_value,
+                        market_value_gbp,
+                        position.get("cost_basis"),
+                        position.get("unrealized_pl"),
+                        base_currency,
+                        position.get("asset_class")
+                    )
+                )
+
+            cur.execute(
+                """
+                UPDATE snapshot_runs
+                SET finished_at = %s, status = %s
+                WHERE run_id = %s
+                """,
+                (datetime.now(timezone.utc), "success", run_id)
+            )
+
+        conn.commit()
+        return True
+    except Exception as exc:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE snapshot_runs
+                SET finished_at = %s, status = %s, error_summary = %s
+                WHERE run_id = %s
+                """,
+                (datetime.now(timezone.utc), "fail", str(exc), run_id)
+            )
+            conn.commit()
+        st.error(f"Failed to store snapshot: {exc}")
+        return False
+    finally:
+        conn.close()
 
 #######################################################
 # Charles Schwab Functions
@@ -863,7 +1151,8 @@ def combine_portfolio_data(schwab_data, ib_data):
             "account_id": account["account_id"],
             "account_name": account["account_name"],
             "account_type": account["account_type"],
-            "value": account["value"]
+            "value": account["value"],
+            "currency": account.get("currency")
         })
     
     # Add Interactive Brokers accounts to the combined accounts list
@@ -874,7 +1163,8 @@ def combine_portfolio_data(schwab_data, ib_data):
             "account_id": account["account_id"],
             "account_name": account["account_name"],
             "account_type": account["account_type"],
-            "value": account["value"]
+            "value": account["value"],
+            "currency": account.get("currency")
         })
     
     # Add Schwab positions to the combined positions list
@@ -984,6 +1274,7 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     })
     fx_rates = {}
     fx_rates_gbp = {}
+    fx_rates_usd = {}
     if gateway_url and session:
         for currency in currencies:
             if currency != display_currency:
@@ -992,6 +1283,9 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
             if currency != "GBP":
                 rate_gbp = fetch_fx_rate(session, gateway_url, "GBP", currency)
                 fx_rates_gbp[("GBP", currency)] = rate_gbp
+            if currency != "USD":
+                rate_usd = fetch_fx_rate(session, gateway_url, "USD", currency)
+                fx_rates_usd[("USD", currency)] = rate_usd
     
     # Display total portfolio value
     st.subheader("Total Portfolio Value")
@@ -1000,6 +1294,8 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # Use st.metric to display the value
     # In a real app, you would calculate the change values for the third parameter
     display_total_value = 0
+    total_gbp_sum = 0
+    total_usd_sum = 0
     broker_totals = {}
     account_totals = {}
     for position in filtered_data["positions"]:
@@ -1007,8 +1303,10 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         currency_for_fx = base_currency or display_currency
         rate = fx_rates.get((display_currency, currency_for_fx), 1.0 if currency_for_fx == display_currency else None)
         gbp_rate = fx_rates_gbp.get(("GBP", base_currency), 1.0 if base_currency == "GBP" else None)
+        usd_rate = fx_rates_usd.get(("USD", base_currency), 1.0 if base_currency == "USD" else None)
         converted_value = None
         gbp_value = None
+        usd_value = None
         if rate:
             converted_value = position.get("market_value", 0) / rate
             display_total_value += converted_value
@@ -1020,6 +1318,10 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
             account_totals[account_id] = account_totals.get(account_id, 0) + converted_value
         if gbp_rate:
             gbp_value = position.get("market_value", 0) / gbp_rate
+            total_gbp_sum += gbp_value
+        if usd_rate:
+            usd_value = position.get("market_value", 0) / usd_rate
+            total_usd_sum += usd_value
 
         position["base_currency"] = base_currency or "Unknown"
         position["fx_rate"] = rate
@@ -1028,6 +1330,11 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         position["gbp_value"] = gbp_value
         position["gbp_unrealized_pl"] = (
             position.get("unrealized_pl", 0) / gbp_rate if gbp_rate else None
+        )
+        position["usd_rate"] = usd_rate
+        position["usd_value"] = usd_value
+        position["usd_unrealized_pl"] = (
+            position.get("unrealized_pl", 0) / usd_rate if usd_rate else None
         )
 
     total_value = display_total_value
@@ -1143,7 +1450,7 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # Prepare allocation data for pie chart
     allocation_data = []
     allocation_map = {}
-    total_gbp = 0
+    total_allocation = 0
     for position in filtered_data["positions"]:
         symbol = position.get("symbol", "Unknown")
         if symbol not in allocation_map:
@@ -1151,14 +1458,15 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
                 "total_value": 0,
                 "description": position.get("description", "Unknown")
             }
-        if position.get("gbp_value") is not None:
-            allocation_map[symbol]["total_value"] += position["gbp_value"]
-            total_gbp += position["gbp_value"]
+        allocation_value = position.get("gbp_value") if display_currency == "GBP" else position.get("usd_value")
+        if allocation_value is not None:
+            allocation_map[symbol]["total_value"] += allocation_value
+            total_allocation += allocation_value
 
     for symbol, data in allocation_map.items():
         # Calculate percentage of total, avoiding division by zero
-        if total_gbp > 0:
-            percentage = (data["total_value"] / total_gbp) * 100
+        if total_allocation > 0:
+            percentage = (data["total_value"] / total_allocation) * 100
         else:
             percentage = 0
             
@@ -1186,7 +1494,7 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         names="Symbol", 
         title="Portfolio Allocation by Security",
         hover_data=["Description", "Percentage"],
-        labels={"Value": "Market Value (GBP)"}
+        labels={"Value": f"Market Value ({display_currency})"}
     )
     
     # Configure the pie chart to show percentages and labels
@@ -1198,12 +1506,12 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # Display allocation by asset class
     st.subheader("Portfolio Allocation by Asset Class")
     class_allocation = {}
-    total_gbp_value = 0
+    total_allocation_value = 0
     for position in filtered_data["positions"]:
-        gbp_value = position.get("gbp_value")
-        if gbp_value is None:
+        allocation_value = position.get("gbp_value") if display_currency == "GBP" else position.get("usd_value")
+        if allocation_value is None:
             continue
-        total_gbp_value += gbp_value
+        total_allocation_value += allocation_value
         asset_class = position.get("asset_class", "Other")
         conid = position.get("conid")
         if conid and gateway_url and session:
@@ -1214,11 +1522,11 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
                 asset_class = "Money Market Funds"
         if position.get("symbol") == "CASH":
             asset_class = "Cash"
-        class_allocation[asset_class] = class_allocation.get(asset_class, 0) + gbp_value
+        class_allocation[asset_class] = class_allocation.get(asset_class, 0) + allocation_value
 
     class_rows = []
     for asset_class, value in class_allocation.items():
-        percentage = (value / total_gbp_value * 100) if total_gbp_value else 0
+        percentage = (value / total_allocation_value * 100) if total_allocation_value else 0
         class_rows.append({
             "Asset Class": asset_class,
             "Value": value,
@@ -1233,7 +1541,7 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
             names="Asset Class",
             title="Portfolio Allocation by Asset Class",
             hover_data=["Percentage"],
-            labels={"Value": "Market Value (GBP)"}
+            labels={"Value": f"Market Value ({display_currency})"}
         )
         fig_class.update_traces(textinfo="percent+label")
         st.plotly_chart(fig_class)
@@ -1277,6 +1585,10 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
 
     converted_label = "Market Value (GBP)"
     converted_pnl_label = "Unrealized P&L (GBP)"
+    usd_value_label = "Market Value (USD)"
+    usd_pnl_label = "Unrealized P&L (USD)"
+    fx_rate_gbp_label = "FX Rate (GBP)"
+    fx_rate_usd_label = "FX Rate (USD)"
     market_value_base_label = "Market Value (Base)"
     cost_basis_base_label = "Cost Basis (Base)"
     unrealized_base_label = "Unrealized P&L (Base)"
@@ -1297,7 +1609,7 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         if position.get("symbol") == "CASH":
             asset_class = "Cash"
         gbp_value = position.get("gbp_value")
-        total_gbp_value = total_gbp if total_gbp else None
+        total_gbp_value = total_gbp_sum if total_gbp_sum else None
         percent_portfolio = (gbp_value / total_gbp_value * 100) if gbp_value is not None and total_gbp_value else None
         positions_data.append({
             "Broker": position["broker"],
@@ -1307,13 +1619,16 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
             "Quantity": position["quantity"],
             market_value_base_label: position["market_value"],
             "Base Currency": position.get("base_currency"),
-            "FX Rate": position.get("gbp_rate"),
+            fx_rate_gbp_label: position.get("gbp_rate"),
+            fx_rate_usd_label: position.get("usd_rate"),
             converted_label: position.get("gbp_value"),
-            "% Portfolio (GBP)": percent_portfolio,
+            usd_value_label: position.get("usd_value"),
+            "% Portfolio": percent_portfolio,
             "Unrealized P&L (%)": position["unrealized_pl_percent"],
             cost_basis_base_label: position["cost_basis"],
             unrealized_base_label: position["unrealized_pl"],
-            converted_pnl_label: position.get("gbp_unrealized_pl")
+            converted_pnl_label: position.get("gbp_unrealized_pl"),
+            usd_pnl_label: position.get("usd_unrealized_pl")
         })
     
     # Convert to DataFrame and sort by Market Value descending
@@ -1337,16 +1652,28 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         df_positions[converted_label] = df_positions[converted_label].map(
             lambda v: round(v, 2) if isinstance(v, (int, float)) else None
         )
-    if "% Portfolio (GBP)" in df_positions.columns:
-        df_positions["% Portfolio (GBP)"] = df_positions["% Portfolio (GBP)"].map(
+    if usd_value_label in df_positions.columns:
+        df_positions[usd_value_label] = df_positions[usd_value_label].map(
+            lambda v: round(v, 2) if isinstance(v, (int, float)) else None
+        )
+    if "% Portfolio" in df_positions.columns:
+        df_positions["% Portfolio"] = df_positions["% Portfolio"].map(
             lambda v: f"{v:.2f}%" if isinstance(v, (int, float)) else None
         )
     if converted_pnl_label in df_positions.columns:
         df_positions[converted_pnl_label] = df_positions[converted_pnl_label].map(
             lambda v: round(v, 2) if isinstance(v, (int, float)) else None
         )
-    if "FX Rate" in df_positions.columns:
-        df_positions["FX Rate"] = df_positions["FX Rate"].map(
+    if usd_pnl_label in df_positions.columns:
+        df_positions[usd_pnl_label] = df_positions[usd_pnl_label].map(
+            lambda v: round(v, 2) if isinstance(v, (int, float)) else None
+        )
+    if fx_rate_gbp_label in df_positions.columns:
+        df_positions[fx_rate_gbp_label] = df_positions[fx_rate_gbp_label].map(
+            lambda v: round(v, 6) if isinstance(v, (int, float)) else None
+        )
+    if fx_rate_usd_label in df_positions.columns:
+        df_positions[fx_rate_usd_label] = df_positions[fx_rate_usd_label].map(
             lambda v: round(v, 6) if isinstance(v, (int, float)) else None
         )
     # Format % P/L with two decimal places
@@ -1531,7 +1858,7 @@ def display_example_dashboard():
 # Parameters:
 # - List of tab names
 # It returns a list of tab objects that can be used with "with" statements
-tab1, tab2, tab3, tab4 = st.tabs(["Portfolio Summary", "Authentication", "Settings", "Help"])
+tab1, tab2, tab4 = st.tabs(["Portfolio Summary", "Authentication", "Help"])
 
 # Authentication tab
 # The "with" statement focuses the following code on a specific tab
@@ -1722,6 +2049,8 @@ with tab1:
         st.session_state["refresh_requested"] = True
         st.experimental_rerun()
 
+    store_snapshot_clicked = st.sidebar.button("Store snapshot")
+
     if st.session_state.pop("refresh_requested", False):
         st.session_state.pop("ib_fx_cache", None)
         st.session_state.pop("ib_company_cache", None)
@@ -1763,6 +2092,7 @@ with tab1:
             
             # If we got data successfully
             if raw_account_info:
+                st.session_state["raw_schwab_data"] = raw_account_info
                 # Parse the raw data into a structured format
                 schwab_data = parse_schwab_data(raw_account_info)
     
@@ -1777,6 +2107,7 @@ with tab1:
             
             # If we got data successfully
             if raw_ib_data:
+                st.session_state["raw_ib_data"] = raw_ib_data
                 # Parse the raw data into a structured format
                 ib_data = parse_ib_data(raw_ib_data)
     
@@ -1795,9 +2126,18 @@ with tab1:
         # Display the portfolio summary with the selected view type
         display_portfolio_summary(combined_data, view_mapping[view_option], display_currency=display_currency)
 
+        if store_snapshot_clicked:
+            raw_schwab = st.session_state.get("raw_schwab_data")
+            raw_ib = st.session_state.get("raw_ib_data")
+            stored = store_snapshot_to_db(combined_data, raw_schwab, raw_ib)
+            if stored:
+                st.sidebar.success("Snapshot stored in Postgres.")
     else:
         # If no data is available, show instructions
         st.info("Please connect at least one brokerage account in the Authentication tab.")
+
+        if store_snapshot_clicked:
+            st.sidebar.warning("No portfolio data available to store yet.")
         
         # Show example dashboard if user wants to see a preview
         if st.button("Show Example Dashboard"):
@@ -1813,61 +2153,6 @@ with tab1:
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
         st.info("No data sources recorded yet. Refresh data to pull the latest feeds.")
-
-# Settings tab
-with tab3:
-    st.header("Settings")
-    
-    # Data Refresh settings
-    st.subheader("Data Refresh")
-    
-    # Add a slider for refresh interval
-    # st.slider creates a slider control
-    # Parameters:
-    # - Label for the slider
-    # - Minimum value
-    # - Maximum value
-    # - Default value
-    refresh_interval = st.slider("Auto-refresh interval (minutes)", 0, 60, 15)
-    
-    # Display the selected setting
-    st.info(f"Dashboard will auto-refresh every {refresh_interval} minutes. Set to 0 to disable auto-refresh.")
-    
-    # Display Settings
-    st.subheader("Display Settings")
-    
-    # Add a dropdown for currency selection
-    # st.selectbox creates a dropdown selector
-    # Parameters:
-    # - Label for the selector
-    # - List of options
-    # - index=0 sets the first option as the default
-    currency = st.selectbox("Display Currency", ["USD", "GBP", "EUR", "JPY"], index=0)
-    
-    # Display the selected setting
-    st.info(f"All values will be converted to {currency} using current exchange rates.")
-    
-    # Notifications settings
-    st.subheader("Notifications")
-    
-    # Add a checkbox for enabling notifications
-    # st.checkbox creates a checkbox control
-    # Parameters:
-    # - Label for the checkbox
-    # - value=False sets the default state to unchecked
-    enable_notifications = st.checkbox("Enable email notifications for significant changes", value=False)
-    
-    # If notifications are enabled, show additional options
-    if enable_notifications:
-        # Add a text input for email
-        # st.text_input creates a text entry field
-        email = st.text_input("Email address for notifications")
-        
-        # Add a slider for notification threshold
-        threshold = st.slider("Notification threshold (%)", 1, 10, 5)
-        
-        # Display the selected setting
-        st.info(f"You'll receive email notifications when portfolio value changes by {threshold}% or more.")
 
 # Help tab
 with tab4:
