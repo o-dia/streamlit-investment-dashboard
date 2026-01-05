@@ -57,7 +57,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 # These URLs are where our app will send requests to interact with Schwab's API
 SCHWAB_AUTH_URL = "https://api.schwabapi.com/v1/oauth/authorize"  # For user authorization
 SCHWAB_TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"     # For getting access tokens
-SCHWAB_ACCOUNTS_URL = "https://api.schwab.com/v2/accounts"        # For retrieving account data
+SCHWAB_ACCOUNTS_URL = "https://api.schwabapi.com/trader/v1/accounts?fields=positions"  # For retrieving account data
 
 #######################################################
 # Database Persistence (manual snapshots)
@@ -364,15 +364,28 @@ def get_schwab_access_token(auth_code):
     4. Returns the access token or None if there's an error
     """
     # Add debugging information to the Streamlit interface
-    st.write(f"Attempting to exchange auth code for token...")
+    st.write("Attempting to exchange auth code for token...")
+    st.write(
+        f"Env checks - client_id len: {len(SCHWAB_CLIENT_ID) if SCHWAB_CLIENT_ID else 0}, "
+        f"client_secret len: {len(SCHWAB_CLIENT_SECRET) if SCHWAB_CLIENT_SECRET else 0}"
+    )
+    if not SCHWAB_CLIENT_ID or not SCHWAB_CLIENT_SECRET:
+        st.error("Missing SCHWAB_CLIENT_ID or SCHWAB_CLIENT_SECRET in environment.")
     
     # Prepare the request payload according to OAuth standards
+    # NOTE: Keeping the original client_secret-in-body approach commented for easy revert.
+    # payload = {
+    #     "grant_type": "authorization_code",  # Type of OAuth grant
+    #     "code": auth_code,                   # The code we received
+    #     "redirect_uri": SCHWAB_REDIRECT_URI, # Must match what was registered
+    #     "client_id": SCHWAB_CLIENT_ID,       # Our app's ID
+    #     "client_secret": SCHWAB_CLIENT_SECRET, # Our app's secret
+    # }
     payload = {
-        "grant_type": "authorization_code",  # Type of OAuth grant
-        "code": auth_code,                   # The code we received
-        "redirect_uri": SCHWAB_REDIRECT_URI, # Must match what was registered
-        "client_id": SCHWAB_CLIENT_ID,       # Our app's ID
-        "client_secret": SCHWAB_CLIENT_SECRET, # Our app's secret
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "redirect_uri": SCHWAB_REDIRECT_URI,
+        "client_id": SCHWAB_CLIENT_ID
     }
     
     # Show some information (with sensitive parts redacted)
@@ -383,11 +396,17 @@ def get_schwab_access_token(auth_code):
     try:
         # Log the API endpoint we're contacting
         st.write(f"Sending request to: {SCHWAB_TOKEN_URL}")
+        st.write("Auth method: HTTP Basic for client credentials")
         
         # Send the POST request to Schwab's token endpoint
         # - requests.post() makes an HTTP POST request
         # - data=payload sends our parameters in the request body
-        response = requests.post(SCHWAB_TOKEN_URL, data=payload)
+        # response = requests.post(SCHWAB_TOKEN_URL, data=payload)
+        response = requests.post(
+            SCHWAB_TOKEN_URL,
+            data=payload,
+            auth=(SCHWAB_CLIENT_ID, SCHWAB_CLIENT_SECRET)
+        )
         
         # Log the response status code and body for debugging
         st.write(f"Response status code: {response.status_code}")
@@ -447,8 +466,7 @@ def get_schwab_account_info(access_token):
     # Prepare the request headers
     # The Authorization header uses the Bearer token format for OAuth
     headers = {
-        "Authorization": f"Bearer {access_token}",  # Include access token
-        "Content-Type": "application/json"          # Specify JSON format
+        "Authorization": f"Bearer {access_token}"
     }
     
     try:
@@ -460,7 +478,6 @@ def get_schwab_account_info(access_token):
         # Raise an exception for 4XX/5XX status codes
         response.raise_for_status()
         
-        # Parse and return the JSON response
         return response.json()
     
     # Handle any request-related errors
@@ -488,9 +505,8 @@ def parse_schwab_data(raw_data):
     based on the actual structure of Schwab's API response.
     """
     try:
-        # Get the accounts array from the response, or empty list if not found
-        # The .get() method on dictionaries returns a default value if the key doesn't exist
-        accounts = raw_data.get("accounts", [])
+        # Schwab Trader API returns a list of accounts with "securitiesAccount"
+        accounts = raw_data if isinstance(raw_data, list) else raw_data.get("accounts", [])
         
         # Initialize the structured data with empty values
         parsed_data = {
@@ -501,39 +517,95 @@ def parse_schwab_data(raw_data):
         
         # Process each account in the accounts array
         for account in accounts:
-            # Extract the account value, defaulting to 0 if not found
-            # The nested .get() calls handle the case where "balances" doesn't exist
-            account_value = float(account.get("balances", {}).get("totalAccountValue", 0))
+            account_wrapper = account.get("securitiesAccount", account) if isinstance(account, dict) else {}
+            balances = account_wrapper.get("aggregatedBalance", {})
+            current_balances = account_wrapper.get("currentBalances", {})
+            account_value = (
+                balances.get("currentLiquidationValue")
+                or balances.get("liquidationValue")
+                or current_balances.get("liquidationValue")
+                or current_balances.get("equity")
+                or current_balances.get("accountValue")
+                or 0
+            )
+            try:
+                account_value = float(account_value)
+            except (TypeError, ValueError):
+                account_value = 0
             
             # Add this account's value to the total
             parsed_data["total_value"] += account_value
             
             # Add account details to the accounts array
+            account_currency = account_wrapper.get("currency") or "USD"
             parsed_data["accounts"].append({
-                "account_id": account.get("accountId", "Unknown"),     # Account identifier
-                "account_name": account.get("accountName", "Unknown"), # Account name
-                "account_type": account.get("accountType", "Unknown"), # Account type
-                "value": account_value                                # Account value
+                "account_id": account_wrapper.get("accountNumber", "Unknown"),
+                "account_name": account_wrapper.get("accountNumber", "Unknown"),
+                "account_type": account_wrapper.get("type", "Unknown"),
+                "value": account_value,
+                "currency": account_currency
             })
+
+            cash_balance = (
+                current_balances.get("cashBalance")
+                or current_balances.get("availableFundsNonMarginableTrade")
+                or current_balances.get("availableFunds")
+                or 0
+            )
+            try:
+                cash_balance = float(cash_balance)
+            except (TypeError, ValueError):
+                cash_balance = 0
+            if cash_balance > 0:
+                parsed_data["positions"].append({
+                    "account_id": account_wrapper.get("accountNumber", "Unknown"),
+                    "symbol": "CASH",
+                    "description": "Cash",
+                    "quantity": 1,
+                    "market_value": cash_balance,
+                    "cost_basis": cash_balance,
+                    "unrealized_pl": 0,
+                    "unrealized_pl_percent": 0,
+                    "currency": account_currency,
+                    "asset_class": "Cash"
+                })
             
             # Get positions for this account, defaulting to empty list if not found
-            positions = account.get("positions", [])
+            positions = account_wrapper.get("positions", [])
             
             # Process each position in this account
             for position in positions:
                 # Get security details, defaulting to empty dict if not found
-                security = position.get("security", {})
+                security = position.get("instrument", position.get("security", {}))
+                symbol = security.get("symbol") or security.get("ticker") or security.get("cusip") or "Unknown"
+                description = security.get("description") or security.get("assetType") or symbol
                 
                 # Add position details to the positions array
+                position_currency = security.get("currency") or account_currency or "USD"
+                raw_asset_class = security.get("assetType") or security.get("type") or "Other"
+                asset_class_map = {
+                    "EQUITY": "Stocks",
+                    "COLLECTIVE_INVESTMENT": "Commodity ETFs"
+                }
+                asset_class = asset_class_map.get(raw_asset_class, raw_asset_class)
+                quantity = (
+                    position.get("longQuantity")
+                    or position.get("previousSessionLongQuantity")
+                    or position.get("quantity")
+                    or 0
+                )
+                avg_price = position.get("taxLotAverageLongPrice", position.get("averageLongPrice", 0)) or 0
                 parsed_data["positions"].append({
-                    "account_id": account.get("accountId", "Unknown"),      # Link to account
-                    "symbol": security.get("symbol", "Unknown"),           # Stock symbol
-                    "description": security.get("description", "Unknown"),  # Security name
-                    "quantity": float(position.get("quantity", 0)),         # Shares owned
-                    "market_value": float(position.get("marketValue", 0)),  # Current value
-                    "cost_basis": float(position.get("costBasis", 0)),      # Purchase cost
-                    "unrealized_pl": float(position.get("unrealizedPL", 0)), # Profit/loss
-                    "unrealized_pl_percent": float(position.get("unrealizedPLPercent", 0)) # P/L %
+                    "account_id": account_wrapper.get("accountNumber", "Unknown"),
+                    "symbol": symbol,
+                    "description": description,
+                    "quantity": float(quantity),
+                    "market_value": float(position.get("marketValue", 0) or 0),
+                    "cost_basis": float(avg_price) * float(quantity),
+                    "unrealized_pl": float(position.get("longOpenProfitLoss", position.get("shortOpenProfitLoss", 0)) or 0),
+                    "unrealized_pl_percent": float(position.get("longOpenProfitLossPercent", position.get("shortOpenProfitLossPercent", 0)) or 0),
+                    "currency": position_currency,
+                    "asset_class": asset_class
                 })
         
         # Return the fully structured data
@@ -1182,7 +1254,9 @@ def combine_portfolio_data(schwab_data, ib_data):
             "market_value": position["market_value"],
             "cost_basis": position["cost_basis"],
             "unrealized_pl": position["unrealized_pl"],
-            "unrealized_pl_percent": position["unrealized_pl_percent"]
+            "unrealized_pl_percent": position["unrealized_pl_percent"],
+            "currency": position.get("currency", "USD"),
+            "asset_class": position.get("asset_class", "Other")
         })
         
         # Update allocation by symbol
@@ -1300,6 +1374,8 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     account_totals = {}
     for position in filtered_data["positions"]:
         base_currency = position.get("currency")
+        if position.get("broker") == "Schwab" and not base_currency:
+            base_currency = "USD"
         currency_for_fx = base_currency or display_currency
         rate = fx_rates.get((display_currency, currency_for_fx), 1.0 if currency_for_fx == display_currency else None)
         gbp_rate = fx_rates_gbp.get(("GBP", base_currency), 1.0 if base_currency == "GBP" else None)
@@ -1338,8 +1414,7 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         )
 
     total_value = display_total_value
-    currency_symbol = "£" if display_currency == "GBP" else "$"
-    st.metric("Portfolio Value", f"{currency_symbol}{total_value:,.2f}", "")
+    st.metric("Portfolio Value", f"{total_value:,.2f}", display_currency)
     
     # Create a row with three columns for summary metrics
     # st.columns creates a layout with the specified number of equal-width columns
@@ -1379,41 +1454,72 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
                 "Value": value,
                 "Percentage": percentage
             })
-        
-        # Create broker breakdown pie chart using Plotly Express
-        # px.pie creates a pie chart visualization
-        # Parameters:
-        # - data: The data to visualize
-        # - values: Which field contains the numerical values
-        # - names: Which field contains the category names
-        # - title: Chart title
-        # - hover_data: Additional fields to show on hover
-        # - labels: Custom labels for the data fields
-        fig_broker = px.pie(
-            broker_data, 
-            values="Value", 
-            names="Broker", 
-            title="Portfolio by Broker",
-            hover_data=["Percentage"],
-            labels={"Value": "Portfolio Value"}
-        )
-        
-        # Configure the pie chart to show percentages and labels
-        fig_broker.update_traces(textinfo="percent+label")
-        
-        # Display the chart in the Streamlit app
-        st.plotly_chart(fig_broker)
+
+        if broker_data:
+            # Create broker breakdown pie chart using Plotly Express
+            # px.pie creates a pie chart visualization
+            # Parameters:
+            # - data: The data to visualize
+            # - values: Which field contains the numerical values
+            # - names: Which field contains the category names
+            # - title: Chart title
+            # - hover_data: Additional fields to show on hover
+            # - labels: Custom labels for the data fields
+            fig_broker = px.pie(
+                broker_data, 
+                values="Value", 
+                names="Broker", 
+                title="Portfolio by Broker",
+                hover_data=["Percentage"],
+                labels={"Value": "Portfolio Value"}
+            )
+            
+            # Configure the pie chart to show percentages and labels
+            fig_broker.update_traces(textinfo="percent+label")
+            
+            # Display the chart in the Streamlit app
+            st.plotly_chart(fig_broker)
+        else:
+            st.info("No broker data available yet.")
     
     # Display account breakdown
     st.subheader("Account Breakdown")
     
     # Prepare account data for display
     account_data = []
+    account_value_label = "Market Value (Base)"
+    account_ccy_label = "Base Currency"
+    account_value_usd_label = "Market Value (USD)"
+    account_value_gbp_label = "Market Value (GBP)"
     for account in filtered_data["accounts"]:
         # Calculate percentage of total, avoiding division by zero
+        base_currency = account.get("currency")
+        if account.get("broker") == "Interactive Brokers" and (not base_currency or base_currency == "Unknown"):
+            base_currency = "GBP"
+        if account.get("broker") == "Schwab" and (not base_currency or base_currency == "Unknown"):
+            base_currency = "USD"
+
+        base_value = account.get("value")
+        display_value = account_totals.get(account["account_id"])
+        if display_value is None:
+            display_value = base_value
+
+        rate_to_display = fx_rates.get((display_currency, base_currency), 1.0 if base_currency == display_currency else None)
+        if rate_to_display is None and display_currency == "GBP" and base_currency == "USD":
+            rate_to_display = fx_rates_gbp.get(("GBP", "USD"))
+        value_display = display_value if display_value is not None else (base_value / rate_to_display if rate_to_display and base_value is not None else None)
+
+        if (base_value is None or base_value == 0) and display_value is not None and rate_to_display:
+            base_value = display_value * rate_to_display
+
+        rate_to_usd = fx_rates_usd.get(("USD", base_currency), 1.0 if base_currency == "USD" else None)
+        value_usd = base_value / rate_to_usd if rate_to_usd and base_value is not None else None
+
+        rate_to_gbp = fx_rates_gbp.get(("GBP", base_currency), 1.0 if base_currency == "GBP" else None)
+        value_gbp = base_value / rate_to_gbp if rate_to_gbp and base_value is not None else None
+
         if total_value > 0:
-            value = account_totals.get(account["account_id"], account["value"])
-            percentage = (value / total_value) * 100
+            percentage = (value_display / total_value) * 100 if value_display is not None else 0
         else:
             percentage = 0
             
@@ -1422,7 +1528,10 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
             "Broker": account["broker"],
             "Account": account["account_name"],
             "Type": account["account_type"],
-            f"Value ({display_currency})": account_totals.get(account["account_id"], account["value"]),
+            account_value_label: base_value,
+            account_ccy_label: base_currency or "USD",
+            account_value_usd_label: value_usd,
+            account_value_gbp_label: value_gbp,
             "Percentage": percentage
         })
     
@@ -1432,9 +1541,6 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     
     # Format the Value column as currency
     # The map function applies a format to each value in the column
-    df_accounts[f"Value ({display_currency})"] = df_accounts[f"Value ({display_currency})"].map(
-        lambda v: round(v, 2) if isinstance(v, (int, float)) else v
-    )
     
     # Format the Percentage column with one decimal place
     df_accounts["Percentage"] = df_accounts["Percentage"].map("{:.1f}%".format)
@@ -1442,7 +1548,15 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # Display accounts table
     # st.dataframe displays a DataFrame as an interactive table
     # use_container_width=True makes the table fill the available width
-    st.dataframe(df_accounts, use_container_width=True)
+    st.dataframe(
+        df_accounts,
+        use_container_width=True,
+        column_config={
+            account_value_label: st.column_config.NumberColumn(format="localized", step=0.01),
+            account_value_usd_label: st.column_config.NumberColumn(format="localized", step=0.01),
+            account_value_gbp_label: st.column_config.NumberColumn(format="localized", step=0.01)
+        }
+    )
     
     # Display asset allocation
     st.subheader("Asset Allocation")
@@ -1484,24 +1598,27 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # reverse=True means sort in descending order
     allocation_data = sorted(allocation_data, key=lambda x: x["Value"], reverse=True)
     
-    # Convert to DataFrame for plotting
-    df_allocation = pd.DataFrame(allocation_data)
-    
-    # Create pie chart using Plotly Express
-    fig = px.pie(
-        df_allocation, 
-        values="Value", 
-        names="Symbol", 
-        title="Portfolio Allocation by Security",
-        hover_data=["Description", "Percentage"],
-        labels={"Value": f"Market Value ({display_currency})"}
-    )
-    
-    # Configure the pie chart to show percentages and labels
-    fig.update_traces(textinfo="percent+label")
-    
-    # Display the chart in the Streamlit app
-    st.plotly_chart(fig)
+    if allocation_data:
+        # Convert to DataFrame for plotting
+        df_allocation = pd.DataFrame(allocation_data)
+        
+        # Create pie chart using Plotly Express
+        fig = px.pie(
+            df_allocation, 
+            values="Value", 
+            names="Symbol", 
+            title="Portfolio Allocation by Security",
+            hover_data=["Description", "Percentage"],
+            labels={"Value": f"Market Value ({display_currency})"}
+        )
+        
+        # Configure the pie chart to show percentages and labels
+        fig.update_traces(textinfo="percent+label")
+        
+        # Display the chart in the Streamlit app
+        st.plotly_chart(fig)
+    else:
+        st.info("No allocation data available yet.")
 
     # Display allocation by asset class
     st.subheader("Portfolio Allocation by Asset Class")
@@ -1636,37 +1753,13 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # The sort_values method sorts a DataFrame in place
     # by="Market Value (Base)" means sort by the "Market Value (Base)" column
     # ascending=False means sort in descending order
-    df_positions = df_positions.sort_values(by=market_value_base_label, ascending=False)
+    if not df_positions.empty and market_value_base_label in df_positions.columns:
+        df_positions = df_positions.sort_values(by=market_value_base_label, ascending=False)
     
     # Format numeric columns
-    df_positions[market_value_base_label] = df_positions[market_value_base_label].map(
-        lambda v: round(v, 2) if isinstance(v, (int, float)) else v
-    )
-    df_positions[cost_basis_base_label] = df_positions[cost_basis_base_label].map(
-        lambda v: round(v, 2) if isinstance(v, (int, float)) else v
-    )
-    df_positions[unrealized_base_label] = df_positions[unrealized_base_label].map(
-        lambda v: round(v, 2) if isinstance(v, (int, float)) else v
-    )
-    if converted_label in df_positions.columns:
-        df_positions[converted_label] = df_positions[converted_label].map(
-            lambda v: round(v, 2) if isinstance(v, (int, float)) else None
-        )
-    if usd_value_label in df_positions.columns:
-        df_positions[usd_value_label] = df_positions[usd_value_label].map(
-            lambda v: round(v, 2) if isinstance(v, (int, float)) else None
-        )
     if "% Portfolio" in df_positions.columns:
         df_positions["% Portfolio"] = df_positions["% Portfolio"].map(
             lambda v: f"{v:.2f}%" if isinstance(v, (int, float)) else None
-        )
-    if converted_pnl_label in df_positions.columns:
-        df_positions[converted_pnl_label] = df_positions[converted_pnl_label].map(
-            lambda v: round(v, 2) if isinstance(v, (int, float)) else None
-        )
-    if usd_pnl_label in df_positions.columns:
-        df_positions[usd_pnl_label] = df_positions[usd_pnl_label].map(
-            lambda v: round(v, 2) if isinstance(v, (int, float)) else None
         )
     if fx_rate_gbp_label in df_positions.columns:
         df_positions[fx_rate_gbp_label] = df_positions[fx_rate_gbp_label].map(
@@ -1681,7 +1774,19 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         df_positions["Unrealized P&L (%)"] = df_positions["Unrealized P&L (%)"].map("{:.2f}%".format)
     
     # Display positions table
-    st.dataframe(df_positions, use_container_width=True)
+    st.dataframe(
+        df_positions,
+        use_container_width=True,
+        column_config={
+            market_value_base_label: st.column_config.NumberColumn(format="localized", step=0.01),
+            cost_basis_base_label: st.column_config.NumberColumn(format="localized", step=0.01),
+            unrealized_base_label: st.column_config.NumberColumn(format="localized", step=0.01),
+            converted_label: st.column_config.NumberColumn(format="localized", step=0.01),
+            usd_value_label: st.column_config.NumberColumn(format="localized", step=0.01),
+            converted_pnl_label: st.column_config.NumberColumn(format="localized", step=0.01),
+            usd_pnl_label: st.column_config.NumberColumn(format="localized", step=0.01)
+        }
+    )
 
 def filter_portfolio_data(combined_data, view_type):
     """
@@ -1858,7 +1963,7 @@ def display_example_dashboard():
 # Parameters:
 # - List of tab names
 # It returns a list of tab objects that can be used with "with" statements
-tab1, tab2, tab4 = st.tabs(["Portfolio Summary", "Authentication", "Help"])
+tab1, tab2, tab3, tab4 = st.tabs(["Portfolio Summary", "Authentication", "DB Explorer", "Help"])
 
 # Authentication tab
 # The "with" statement focuses the following code on a specific tab
@@ -1873,6 +1978,34 @@ with tab2:
     if "schwab_token" in st.session_state:
         # If we have a token, show connected status
         st.success("✅ Connected to Charles Schwab")
+
+        st.subheader("Schwab API Test")
+        st.caption("Read-only test to confirm the Schwab Trader API responds.")
+        if st.button("Test Schwab API"):
+            access_token = st.session_state["schwab_token"].get("access_token")
+            if not access_token:
+                st.error("Access token is missing from session state.")
+            else:
+                test_url = "https://api.schwabapi.com/trader/v1/accounts"
+                try:
+                    response = requests.get(
+                        test_url,
+                        headers={"Authorization": f"Bearer {access_token}"}
+                    )
+                    st.write(f"Status: {response.status_code}")
+                    try:
+                        payload = response.json()
+                        st.json(payload)
+                    except ValueError:
+                        st.write(response.text)
+                except requests.exceptions.RequestException as exc:
+                    st.error(f"Test request failed: {exc}")
+        with st.expander("Show access token (temporary debug)"):
+            token_value = st.session_state.get("schwab_token", {}).get("access_token")
+            if token_value:
+                st.code(token_value, language="text")
+            else:
+                st.info("No access token found in session state.")
         
         # Add a button to disconnect
         # st.button creates a button that returns True when clicked
@@ -1882,7 +2015,7 @@ with tab2:
             
             # Rerun the app to update the UI
             # This restarts the script from the beginning
-            st.experimental_rerun()
+            st.rerun()
     else:
         # If we don't have a token, check for an authorization code
         # st.query_params contains URL query parameters
@@ -1903,10 +2036,10 @@ with tab2:
                 
                 # Clear the query parameter to avoid repeated token requests
                 # This removes the code from the URL
-                st.experimental_set_query_params()
+                st.query_params.clear()
                 
                 # Rerun the app to update the UI
-                st.experimental_rerun()
+                st.rerun()
         else:
             # If no authorization code is present, show the button to authorize
             
@@ -1923,6 +2056,7 @@ with tab2:
             # Display a button that links to the authorization URL
             # st.markdown creates formatted text or links
             st.markdown(f"[Authorize with Schwab]({auth_url})")
+            st.code(auth_url, language="text")
             
             # Display information about the process
             st.info("Note: You'll be redirected to Schwab to authenticate, then back to this app.")
@@ -1946,7 +2080,7 @@ with tab2:
                 del st.session_state["ib_client"]
                 
             # Rerun the app to update the UI
-            st.experimental_rerun()
+            st.rerun()
     else:
         # If not connected, show instructions
         st.info("To connect to Interactive Brokers, you need to set up the IB API Gateway. See the Help tab for setup steps.")
@@ -1964,7 +2098,7 @@ with tab2:
                 st.session_state["ib_client"] = ib_client
                 
                 # Rerun the app to update the UI
-                st.experimental_rerun()
+                st.rerun()
             else:
                 # If connection failed, show error
                 st.error("Failed to connect to Interactive Brokers. Check your credentials and make sure the IB Gateway is running.")
@@ -2047,7 +2181,7 @@ with tab1:
 
     if st.sidebar.button("Refresh data", type="primary" if is_stale else "secondary"):
         st.session_state["refresh_requested"] = True
-        st.experimental_rerun()
+        st.rerun()
 
     store_snapshot_clicked = st.sidebar.button("Store snapshot")
 
@@ -2153,6 +2287,73 @@ with tab1:
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
         st.info("No data sources recorded yet. Refresh data to pull the latest feeds.")
+
+# DB Explorer tab (read-only)
+with tab3:
+    st.header("DB Explorer")
+    st.caption("Read-only views into Postgres for snapshots and positions.")
+
+    conn, error = get_db_connection()
+    if error:
+        st.error(error)
+    else:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    ORDER BY table_name
+                    """
+                )
+                tables = [row[0] for row in cur.fetchall()]
+
+            if not tables:
+                st.info("No tables found. Store a snapshot first to create the schema.")
+            else:
+                table_name = st.selectbox("Select a table", tables)
+                limit = st.number_input("Row limit", min_value=10, max_value=1000, value=200, step=10)
+
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    row_count = cur.fetchone()[0]
+                st.caption(f"Total rows: {row_count}")
+
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT * FROM {table_name} ORDER BY 1 DESC LIMIT %s", (int(limit),))
+                    rows = cur.fetchall()
+                    colnames = [desc[0] for desc in cur.description]
+
+                df_preview = pd.DataFrame(rows, columns=colnames)
+                st.dataframe(df_preview, use_container_width=True)
+
+                st.subheader("Quick views")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if "snapshot_runs" in tables:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT run_id, started_at, status FROM snapshot_runs ORDER BY started_at DESC LIMIT 10"
+                            )
+                            rows = cur.fetchall()
+                            cols = [desc[0] for desc in cur.description]
+                        st.write("Latest snapshot runs")
+                        st.dataframe(pd.DataFrame(rows, columns=cols), use_container_width=True)
+                with col_b:
+                    if "snapshots" in tables:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT broker, broker_account_id, asof_ts, total_value_local FROM snapshots ORDER BY asof_ts DESC LIMIT 10"
+                            )
+                            rows = cur.fetchall()
+                            cols = [desc[0] for desc in cur.description]
+                        st.write("Latest snapshots")
+                        st.dataframe(pd.DataFrame(rows, columns=cols), use_container_width=True)
+        except Exception as exc:
+            st.error(f"Failed to load DB explorer: {exc}")
+        finally:
+            conn.close()
 
 # Help tab
 with tab4:
