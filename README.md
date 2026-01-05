@@ -178,6 +178,10 @@ If you use Schwab OAuth often, you can run ngrok as a macOS LaunchAgent so it ru
     curl -s http://127.0.0.1:4040/api/tunnels
     ```
     Look for `public_url` in the output.
+  - One-liner (prints just the URL if `jq` is installed):
+    ```
+    curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url'
+    ```
 
 ### What if the public URL changes?
 - On the free ngrok plan, URLs can change if ngrok restarts or the session drops.
