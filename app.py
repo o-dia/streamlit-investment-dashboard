@@ -103,6 +103,7 @@ def ensure_snapshot_schema(conn):
                 snapshot_key TEXT NOT NULL UNIQUE,
                 total_value_local NUMERIC,
                 total_value_gbp NUMERIC,
+                total_value_usd NUMERIC,
                 base_currency TEXT DEFAULT 'GBP'
             );
             """
@@ -118,11 +119,24 @@ def ensure_snapshot_schema(conn):
                 quantity NUMERIC,
                 market_value_local NUMERIC,
                 market_value_gbp NUMERIC,
+                market_value_usd NUMERIC,
                 cost_basis NUMERIC,
                 unrealized_pl NUMERIC,
                 base_currency TEXT,
                 asset_class TEXT,
                 PRIMARY KEY (snapshot_id, broker, broker_account_id, symbol)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fx_rates (
+                id UUID PRIMARY KEY,
+                run_id UUID NOT NULL REFERENCES snapshot_runs(run_id),
+                asof_ts TIMESTAMPTZ NOT NULL,
+                source_ccy TEXT NOT NULL,
+                target_ccy TEXT NOT NULL,
+                rate NUMERIC NOT NULL
             );
             """
         )
@@ -179,10 +193,15 @@ def get_broker_asof_ts(broker, raw_payload, account_id=None):
                 if candidate:
                     break
     elif broker == "Schwab" and raw_payload:
-        accounts = raw_payload.get("accounts", [])
+        accounts = raw_payload if isinstance(raw_payload, list) else raw_payload.get("accounts", [])
         for account in accounts:
-            if str(account.get("accountId")) == str(account_id):
-                candidate = find_timestamp_candidate(account) or find_timestamp_candidate(account.get("balances", {}))
+            account_wrapper = account.get("securitiesAccount", account) if isinstance(account, dict) else {}
+            if str(account_wrapper.get("accountNumber")) == str(account_id):
+                candidate = (
+                    find_timestamp_candidate(account_wrapper)
+                    or find_timestamp_candidate(account_wrapper.get("currentBalances", {}))
+                    or find_timestamp_candidate(account_wrapper.get("initialBalances", {}))
+                )
                 break
 
     parsed = parse_timestamp(candidate)
@@ -233,6 +252,7 @@ def store_snapshot_to_db(combined_data, raw_schwab_data, raw_ib_data):
                 session.verify = False
 
             snapshot_ids = {}
+            fx_written = set()
             for account in combined_data.get("accounts", []):
                 broker = account.get("broker", "Unknown")
                 account_id = account.get("account_id", "Unknown")
@@ -246,18 +266,36 @@ def store_snapshot_to_db(combined_data, raw_schwab_data, raw_ib_data):
                 total_value_local = account.get("value")
                 base_currency = account.get("currency")
                 total_value_gbp = None
+                total_value_usd = None
                 if base_currency and gateway_url and session:
                     rate = fetch_fx_rate(session, gateway_url, "GBP", base_currency)
                     if rate and total_value_local is not None:
                         total_value_gbp = total_value_local / rate
+                    rate_usd = fetch_fx_rate(session, gateway_url, "USD", base_currency)
+                    if rate_usd and total_value_local is not None:
+                        total_value_usd = total_value_local / rate_usd
+
+                    for source_ccy in ("GBP", "USD", "EUR", "AUD"):
+                        rate_any = fetch_fx_rate(session, gateway_url, source_ccy, "USD")
+                        if rate_any:
+                            fx_key = (source_ccy, "USD")
+                            if fx_key not in fx_written:
+                                cur.execute(
+                                    """
+                                    INSERT INTO fx_rates (id, run_id, asof_ts, source_ccy, target_ccy, rate)
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                    """,
+                                    (uuid.uuid4(), run_id, asof_ts, source_ccy, "USD", rate_any)
+                                )
+                                fx_written.add(fx_key)
 
                 cur.execute(
                     """
                     INSERT INTO snapshots (
                         id, run_id, broker, broker_account_id, asof_ts, snapshot_key,
-                        total_value_local, total_value_gbp, base_currency
+                        total_value_local, total_value_gbp, total_value_usd, base_currency
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         snapshot_id,
@@ -268,6 +306,7 @@ def store_snapshot_to_db(combined_data, raw_schwab_data, raw_ib_data):
                         snapshot_key,
                         total_value_local,
                         total_value_gbp,
+                        total_value_usd,
                         base_currency or "GBP"
                     )
                 )
@@ -284,19 +323,23 @@ def store_snapshot_to_db(combined_data, raw_schwab_data, raw_ib_data):
                 base_currency = position.get("currency")
                 market_value = position.get("market_value")
                 market_value_gbp = None
+                market_value_usd = None
                 if base_currency and gateway_url and session:
                     rate = fetch_fx_rate(session, gateway_url, "GBP", base_currency)
                     if rate:
                         market_value_gbp = market_value / rate if market_value is not None else None
+                    rate_usd = fetch_fx_rate(session, gateway_url, "USD", base_currency)
+                    if rate_usd:
+                        market_value_usd = market_value / rate_usd if market_value is not None else None
 
                 cur.execute(
                     """
                     INSERT INTO positions (
                         snapshot_id, broker, broker_account_id, symbol, description, quantity,
-                        market_value_local, market_value_gbp, cost_basis, unrealized_pl,
+                        market_value_local, market_value_gbp, market_value_usd, cost_basis, unrealized_pl,
                         base_currency, asset_class
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     """,
                     (
@@ -308,6 +351,7 @@ def store_snapshot_to_db(combined_data, raw_schwab_data, raw_ib_data):
                         position.get("quantity"),
                         market_value,
                         market_value_gbp,
+                        market_value_usd,
                         position.get("cost_basis"),
                         position.get("unrealized_pl"),
                         base_currency,
@@ -869,6 +913,9 @@ def parse_ib_data(ib_data):
             for key in keys:
                 if key in summary_map:
                     value = summary_map[key]
+                else:
+                    value = summary_map.get(key.lower())
+                if value is not None:
                     if isinstance(value, dict):
                         amount = value.get("amount")
                         if amount is not None:
@@ -906,10 +953,13 @@ def parse_ib_data(ib_data):
                 [
                     "NetLiquidation",
                     "netLiquidation",
+                    "netliquidation",
                     "EquityWithLoanValue",
                     "equityWithLoanValue",
+                    "equitywithloanvalue",
                     "TotalCashValue",
-                    "totalCashValue"
+                    "totalCashValue",
+                    "totalcashvalue"
                 ]
             ) or 0)
             
@@ -1589,7 +1639,8 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
             "Symbol": symbol,
             "Description": data["description"],
             "Value": data["total_value"],
-        "Percentage": percentage
+            "Percentage": percentage,
+            "PercentageLabel": f"{percentage:.2f}%"
         })
     
     # Sort by value descending
@@ -1603,17 +1654,28 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         df_allocation = pd.DataFrame(allocation_data)
         
         # Create pie chart using Plotly Express
+        df_allocation["HoverText"] = (
+            "<b>" + df_allocation["Symbol"].astype(str) + "</b><br>"
+            + "Description=" + df_allocation["Description"].astype(str) + "<br>"
+            + f"Market Value ({display_currency})=" + df_allocation["Value"].map(lambda v: f"{v:,.2f}") + "<br>"
+            + "Percentage=" + df_allocation["PercentageLabel"].astype(str)
+        )
         fig = px.pie(
-            df_allocation, 
-            values="Value", 
-            names="Symbol", 
+            df_allocation,
+            values="Value",
+            names="Symbol",
             title="Portfolio Allocation by Security",
-            hover_data=["Description", "Percentage"],
+            hover_name="Symbol",
+            hover_data={"HoverText": False},
             labels={"Value": f"Market Value ({display_currency})"}
         )
         
-        # Configure the pie chart to show percentages and labels
-        fig.update_traces(textinfo="percent+label")
+        # Keep labels off the chart and show details on hover only.
+        fig.update_traces(
+            textinfo="none",
+            hovertext=df_allocation["HoverText"],
+            hovertemplate="%{hovertext}<extra></extra>"
+        )
         
         # Display the chart in the Streamlit app
         st.plotly_chart(fig)
@@ -2055,7 +2117,10 @@ with tab2:
             
             # Display a button that links to the authorization URL
             # st.markdown creates formatted text or links
-            st.markdown(f"[Authorize with Schwab]({auth_url})")
+            st.markdown(
+                f'<a href="{auth_url}" target="_self">Authorize with Schwab</a>',
+                unsafe_allow_html=True
+            )
             st.code(auth_url, language="text")
             
             # Display information about the process
@@ -2085,6 +2150,16 @@ with tab2:
         # If not connected, show instructions
         st.info("To connect to Interactive Brokers, you need to set up the IB API Gateway. See the Help tab for setup steps.")
         
+        ib_gateway_url = f"https://{IB_HOST}:{IB_GATEWAY_PORT}"
+        st.markdown(
+            f'<a href="{ib_gateway_url}" target="_self">Open IB Gateway login (same tab)</a>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            '<a href="/" target="_self">Return to Streamlit app</a>',
+            unsafe_allow_html=True
+        )
+
         # Add a button to connect
         if st.button("Connect to Interactive Brokers"):
             # Try to connect
@@ -2226,6 +2301,7 @@ with tab1:
             
             # If we got data successfully
             if raw_account_info:
+                st.session_state.setdefault("data_source_timestamps", {})["Schwab Accounts/Positions"] = datetime.now().isoformat(timespec="seconds")
                 st.session_state["raw_schwab_data"] = raw_account_info
                 # Parse the raw data into a structured format
                 schwab_data = parse_schwab_data(raw_account_info)
@@ -2282,11 +2358,76 @@ with tab1:
     data_sources.setdefault("IB Portfolio Data", "Not fetched")
     data_sources.setdefault("IB FX Rates", "Not fetched")
     data_sources.setdefault("IB Contract Metadata", "Not fetched")
+    data_sources.setdefault("Schwab Accounts/Positions", "Not fetched")
     if data_sources:
         rows = [{"Data Source": key, "Last Updated": value} for key, value in data_sources.items()]
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
         st.info("No data sources recorded yet. Refresh data to pull the latest feeds.")
+
+    st.subheader("Refresh Data Sources")
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        if st.button("Refresh IB Portfolio Data"):
+            if "ib_connected" in st.session_state and st.session_state["ib_connected"]:
+                raw_ib_data = get_ib_account_data()
+                if raw_ib_data:
+                    st.session_state["raw_ib_data"] = raw_ib_data
+                    st.session_state.setdefault("data_source_timestamps", {})["IB Portfolio Data"] = datetime.now().isoformat(timespec="seconds")
+            else:
+                st.warning("Connect to Interactive Brokers first.")
+    with col_b:
+        if st.button("Refresh IB FX Rates"):
+            if combined_data and "ib_connected" in st.session_state and st.session_state["ib_connected"]:
+                st.session_state.pop("ib_fx_cache", None)
+                session = st.session_state.get("ib_session")
+                gateway_url = st.session_state.get("ib_gateway_url")
+                if session is None:
+                    session = requests.Session()
+                    session.verify = False
+                currencies = sorted({
+                    pos.get("currency") for pos in combined_data.get("positions", [])
+                    if isinstance(pos, dict) and pos.get("currency")
+                })
+                for currency in currencies:
+                    fetch_fx_rate(session, gateway_url, "GBP", currency)
+                    fetch_fx_rate(session, gateway_url, "USD", currency)
+                st.session_state.setdefault("data_source_timestamps", {})["IB FX Rates"] = datetime.now().isoformat(timespec="seconds")
+            else:
+                st.warning("Load portfolio data from IB first.")
+    with col_c:
+        if st.button("Refresh IB Contract Metadata"):
+            if combined_data and "ib_connected" in st.session_state and st.session_state["ib_connected"]:
+                st.session_state.pop("ib_contract_cache", None)
+                st.session_state.pop("ib_company_cache", None)
+                session = st.session_state.get("ib_session")
+                gateway_url = st.session_state.get("ib_gateway_url")
+                if session is None:
+                    session = requests.Session()
+                    session.verify = False
+                conids = sorted({
+                    pos.get("conid") for pos in combined_data.get("positions", [])
+                    if isinstance(pos, dict) and pos.get("conid")
+                })
+                for conid in conids:
+                    fetch_contract_metadata(session, gateway_url, conid)
+                    fetch_company_name_for_conid(session, gateway_url, conid)
+                st.session_state.setdefault("data_source_timestamps", {})["IB Contract Metadata"] = datetime.now().isoformat(timespec="seconds")
+            else:
+                st.warning("Load portfolio data from IB first.")
+    with col_d:
+        if st.button("Refresh Schwab Accounts/Positions"):
+            if "schwab_token" in st.session_state:
+                access_token = st.session_state["schwab_token"].get("access_token")
+                if not access_token:
+                    st.warning("Schwab access token is missing.")
+                else:
+                    raw_account_info = get_schwab_account_info(access_token)
+                    if raw_account_info:
+                        st.session_state["raw_schwab_data"] = raw_account_info
+                        st.session_state.setdefault("data_source_timestamps", {})["Schwab Accounts/Positions"] = datetime.now().isoformat(timespec="seconds")
+            else:
+                st.warning("Connect to Charles Schwab first.")
 
 # DB Explorer tab (read-only)
 with tab3:
