@@ -48,10 +48,3 @@ From this point on, the end points documented in the API spec should be availabl
 
 There is an external Client Portal API guide with test pages at: [https://interactivebrokers.github.io/cpwebapi](https://interactivebrokers.github.io/cpwebapi)
 
-
-
-
-
-•  proxyRemoteHost: "https://api.ibkr.com" → This is the IB API endpoint; changing it would break connectivity 
-•  sslCert and sslPwd → These are security settings; changing them would break HTTPS 
-•  svcEnvironment: "v1" → This defines the API version to use

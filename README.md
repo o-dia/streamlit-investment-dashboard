@@ -1,216 +1,176 @@
 # Investment Portfolio Dashboard
 
-A Streamlit-based dashboard that provides a holistic view of investments. 
-I created this because I have to check my different investment accounts separately, on my phone, 
-but I increasingly want to load ONE app where I view everything together and I can understand and track
-how my investments are doing. I have integrated with Charles Schwab and Interactive Brokers, but you can use 
-this framework to add more portfolios and it should work all the same - you just need to authenticate with
-the relevant brokerage and make sure their APIs support what you need.
+A Streamlit dashboard for viewing investment accounts from multiple brokers in one place.
+
+The current app supports:
+
+- Charles Schwab
+- Interactive Brokers
+- Postgres-backed snapshot storage
+
+The goal is to make it easier to see total portfolio value, holdings, allocation, and recent snapshots without jumping between broker apps.
 
 ## Features
 
-- **Portfolio Overview**: View total portfolio value and performance across all accounts
-- **Multi-Broker Support**: Integrate with both Charles Schwab and Interactive Brokers
-- **Flexible Views**: Filter by broker or account type
-- **Asset Allocation**: Visualize portfolio allocation by security
-- **Performance Metrics**: Track unrealized P/L, returns, and more
+- Combined portfolio view across supported brokers
+- Per-account and per-position breakdowns
+- Asset allocation charts
+- Manual snapshot storage in Postgres
+- Read-only DB Explorer inside the Streamlit app
 
-## Screenshots
+## Tech Stack
 
-[Coming soon]
-
-## Requirements
-
-- Python 3.8+
+- Python 3.11
 - Streamlit
-- PostgreSQL (for persistence)
-- ngrok (for OAuth authentication)
-- API credentials for Charles Schwab and/or Interactive Brokers
+- Plotly
+- Pandas / NumPy
+- PostgreSQL
+- Charles Schwab OAuth
+- Interactive Brokers Client Portal API Gateway
 
-## Installation
+## Prerequisites
 
-1. Clone the repository:
-   ```
-   git clone https://github.com/o-dia/streamlit-investment-dashboard.git
-   cd streamlit-investment-dashboard
-   ```
+Install these before starting:
 
-2. Create and activate your conda environment:
-   ```
-   conda activate streamlit-dashboard
-   ```
+- Conda or Miniconda
+- Python 3.11
+- PostgreSQL running locally
+- `ngrok` if you want to use Schwab OAuth
+- Interactive Brokers Client Portal API Gateway if you want IB data
 
-3. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+## Clone And Install
 
-4. Create a `.env` file with your credentials:
-   ```
-   SCHWAB_CLIENT_ID=your_client_id_here
-   SCHWAB_CLIENT_SECRET=your_client_secret_here
-   SCHWAB_REDIRECT_URI=your_ngrok_url_here/callback
-   
-   # Postgres
-   DATABASE_URL=postgres://user:password@host:5432/portfolio_db
-
-   # For Interactive Brokers (optional)
-   IB_CLIENT_ID=your_ib_client_id
-   IB_GATEWAY_PORT=4001
-   IB_HOST=127.0.0.1
-   ```
-
-## Database Setup (Postgres)
-
-These steps are run by you on the machine hosting Postgres (local laptop or the Pi). The app reads `DATABASE_URL` from `.env`.
-
-### A) Local setup (laptop)
-
-1. Install Postgres and start the service.
-
-2. Create the database (name is `investment_dashboard`):
-   ```
-   createdb investment_dashboard
-   ```
-
-   If you want to create a dedicated app user instead of reusing your existing role:
-   ```
-   psql -U postgres
-   CREATE USER investment_app WITH PASSWORD 'REPLACE_ME';
-   CREATE DATABASE investment_dashboard OWNER investment_app;
-   \q
-   ```
-
-3. Set `DATABASE_URL` in your `.env`:
-   ```
-   DATABASE_URL=postgres://<db_user>:<db_password>@localhost:5432/investment_dashboard
-   ```
-   Example if your Postgres user is `Omar`:
-   ```
-   DATABASE_URL=postgres://Omar:<your_password>@localhost:5432/investment_dashboard
-   ```
-
-4. Verify the connection:
-   ```
-   psql -h localhost -U Omar -d investment_dashboard
-   \conninfo
-   ```
-
-### B) Raspberry Pi setup (SSH)
-
-1. Install Postgres on the Pi:
-   ```
-   sudo apt update
-   sudo apt install postgresql -y
-   ```
-
-2. Create the database and user on the Pi:
-   ```
-   sudo -u postgres psql
-   CREATE USER investment_app WITH PASSWORD 'REPLACE_ME';
-   CREATE DATABASE investment_dashboard OWNER investment_app;
-   \q
-   ```
-
-3. Allow connections from your laptop (Tailscale recommended):
-   - Edit `postgresql.conf` and set:
-     ```
-     listen_addresses = 'localhost,<pi-tailscale-ip>'
-     ```
-   - Edit `pg_hba.conf` and add:
-     ```
-     host    investment_dashboard    investment_app    <laptop-tailscale-ip>/32    scram-sha-256
-     ```
-
-4. Restart Postgres:
-   ```
-   sudo systemctl restart postgresql
-   ```
-
-5. Set `DATABASE_URL` on your laptop:
-   ```
-   DATABASE_URL=postgres://investment_app:REPLACE_ME@<pi-tailscale-ip>:5432/investment_dashboard
-   ```
-
-## Usage (Local)
-
-1. (Optional, Schwab) Start ngrok to create a tunnel for OAuth.
-   - If you set up the LaunchAgent (see below), ngrok will already be running in the background.
-   - Otherwise run:
-     ```
-     ngrok http 8501
-     ```
-
-2. (Optional, Schwab) Update your `.env` file with the ngrok URL
-   - ngrok URLs change each time you run it; update both `.env` and the Schwab developer portal redirect URL to match.
-
-3. (IB) Start the Interactive Brokers Client Portal API Gateway and log in.
-
-4. Run the app:
-   ```
-   streamlit run app.py
-   ```
-
-5. Open your browser to http://localhost:8501
-
-6. Navigate to the Authentication tab to connect your brokerage accounts
-
-## ngrok as a Background Service (macOS LaunchAgent)
-
-If you use Schwab OAuth often, you can run ngrok as a macOS LaunchAgent so it runs in the background and survives terminal closes.
-
-### What changes in your workflow
-- You no longer need to keep a terminal open running `ngrok http 8501`.
-- The tunnel starts at login and is kept alive by macOS.
-- Your public URL stays the same as long as the background process stays up.
-
-### How to check current ngrok status
-- Is it running?
-  ```
-  launchctl list | grep ngrok
-  ```
-  The first column is the PID of the running ngrok process.
-
-- What is the current public URL?
-  - Open the local web UI: `http://127.0.0.1:4040`
-  - Or run:
-    ```
-    curl -s http://127.0.0.1:4040/api/tunnels
-    ```
-    Look for `public_url` in the output.
-  - One-liner (prints just the URL if `jq` is installed):
-    ```
-    curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url'
-    ```
-
-### What if the public URL changes?
-- On the free ngrok plan, URLs can change if ngrok restarts or the session drops.
-- For a stable URL, use a reserved domain (paid ngrok plan).
-- If you want notifications on URL changes, add a small polling script to alert you when `public_url` changes.
-
-## Step-by-Step Terminal Commands (Local)
-
-```
-cd /Users/Omar/Coding/Python/Streamlit
+```bash
+git clone https://github.com/o-dia/streamlit-investment-dashboard.git
+cd streamlit-investment-dashboard
+conda env create -f environment.yml
 conda activate streamlit-dashboard
-pip install -r requirements.txt
-cp .env.example .env
 ```
 
-Edit `.env` with your credentials, then run:
+If the environment already exists and you want to sync it with the repo:
 
+```bash
+conda env update -n streamlit-dashboard -f environment.yml
+conda activate streamlit-dashboard
 ```
+
+## Configure Environment Variables
+
+Create a `.env` file in the project root with values like these:
+
+```env
+SCHWAB_CLIENT_ID=your_client_id_here
+SCHWAB_CLIENT_SECRET=your_client_secret_here
+SCHWAB_REDIRECT_URI=https://your-ngrok-url.ngrok-free.app
+
+IB_HOST=127.0.0.1
+IB_GATEWAY_PORT=5002
+
+DATABASE_URL=postgres://<db_user>:<db_password>@localhost:5432/investment_dashboard
+```
+
+Notes:
+
+- `SCHWAB_REDIRECT_URI` must exactly match the URL registered in the Schwab developer portal.
+- This repo’s bundled IB gateway config listens on port `5002`.
+- The app reads `DATABASE_URL` directly from `.env`.
+
+## Set Up Postgres
+
+Start PostgreSQL using the method that matches your install. For Homebrew:
+
+```bash
+brew services start postgresql@16
+```
+
+Create the app database:
+
+```bash
+createdb investment_dashboard
+```
+
+Verify you can connect:
+
+```bash
+psql -h localhost -U <db_user> -d investment_dashboard
+```
+
+## Run The App
+
+Start Streamlit:
+
+```bash
 streamlit run app.py
 ```
 
+Then open:
+
+```text
+http://localhost:8501
+```
+
+The app can load even if no broker is connected yet.
+
+## Connect Charles Schwab
+
+If you want Schwab data:
+
+1. Start `ngrok` against port `8501`.
+2. Copy the current `public_url`.
+3. Set `SCHWAB_REDIRECT_URI` in `.env` to that exact URL.
+4. Update the same callback URL in the Schwab developer portal.
+5. Open the app and use the `Authentication` tab to authorize Schwab.
+
+Example:
+
+```bash
+ngrok http 8501
+curl -s http://127.0.0.1:4040/api/tunnels
+```
+
+## Connect Interactive Brokers
+
+If you want Interactive Brokers data:
+
+1. Start the Client Portal Gateway.
+2. In the app, use `Open IB Gateway login in a new tab`.
+3. Expect a browser warning about the gateway's self-signed localhost certificate.
+4. Complete the login in the gateway tab.
+5. Return to the app tab and let it auto-connect.
+
+If you are using the gateway files included in this repo:
+
+```bash
+cd clientportal.gw
+./bin/run.sh ./root/conf.yaml
+```
+
+That config listens on:
+
+```text
+https://127.0.0.1:5002
+```
+
+## Database Behavior
+
+The app creates its Postgres tables lazily the first time you store a snapshot.
+
+That means:
+
+- a newly created `investment_dashboard` database may start empty
+- tables appear after you load portfolio data and click `Store snapshot`
+- the `DB Explorer` tab is a convenient read-only way to inspect stored tables and rows
+
+## Returning To The Project Later
+
+This README is meant to help new users clone and run the project for the first time.
+
+If you are coming back to this repo on the original development machine and want the exact local run order, terminal layout, ngrok checks, and service commands, use:
+
+- [LOCAL_STARTUP.md](LOCAL_STARTUP.md)
+
+That file is the project-specific operator runbook.
+
 ## Development Status
 
-This project is currently in development. Authentication with Charles Schwab API is pending resolution.
-
-## Technologies Used
-
-- Python
-- Streamlit
-- Plotly
-- Pandas
-- OAuth for API authentication
+This project is still evolving. Broker authentication and data-fetching flows may need refinement as upstream APIs change.

@@ -1,22 +1,27 @@
 # Import necessary libraries
 import streamlit as st  # Streamlit library for creating web applications
+import streamlit.components.v1 as components  # Small HTML/JS helpers for browser actions
 import pandas as pd     # Pandas for data manipulation and analysis
 import numpy as np      # NumPy for numerical operations
 import time             # Time library for handling time-related tasks
 import requests         # Requests library for making HTTP requests to APIs
 import os               # OS module for interacting with the operating system
 import uuid             # UUIDs for snapshot runs
+from pathlib import Path
+from typing import Any, Optional, cast
 import plotly.express as px          # Plotly Express for simple interactive plots
 import plotly.graph_objects as go     # Plotly Graph Objects for more complex plots
 from datetime import datetime, timezone         # DateTime for handling dates and times
 from dotenv import load_dotenv        # dotenv for loading environment variables from .env file
 import psycopg                         # PostgreSQL driver
+from psycopg import sql
 from psycopg.types.json import Json    # JSON adapter for Postgres
 
 # Load environment variables from .env file
 # This function reads the .env file in your project directory
 # and makes its contents available through os.getenv()
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 # Set page configuration for the Streamlit app
 # This configures the page title and layout
@@ -63,7 +68,7 @@ SCHWAB_ACCOUNTS_URL = "https://api.schwabapi.com/trader/v1/accounts?fields=posit
 # Database Persistence (manual snapshots)
 #######################################################
 
-def get_db_connection():
+def get_db_connection() -> tuple[Optional[psycopg.Connection[Any]], Optional[str]]:
     """
     Create a Postgres connection using DATABASE_URL.
     Returns (conn, error_message).
@@ -75,7 +80,7 @@ def get_db_connection():
     except Exception as exc:
         return None, f"Failed to connect to Postgres: {exc}"
 
-def ensure_snapshot_schema(conn):
+def ensure_snapshot_schema(conn: psycopg.Connection[Any]) -> None:
     """
     Create the minimal schema for snapshot storage if it does not exist.
     """
@@ -174,6 +179,62 @@ def parse_timestamp(value):
             return None
     return None
 
+def normalize_unrealized_pl_percent(raw_percent, cost_basis, unrealized_pl):
+    """
+    Normalize unrealized P/L percentages across broker payloads.
+
+    Some broker payloads provide percentage values as fractions (0.1538),
+    some as percentages (15.38), and some omit them entirely. Prefer the
+    representation that is closest to the value implied by P/L and cost basis.
+    """
+    try:
+        raw_value = float(raw_percent) if raw_percent is not None else None
+    except (TypeError, ValueError):
+        raw_value = None
+
+    try:
+        cost_basis_value = float(cost_basis) if cost_basis is not None else None
+    except (TypeError, ValueError):
+        cost_basis_value = None
+
+    try:
+        unrealized_pl_value = float(unrealized_pl) if unrealized_pl is not None else None
+    except (TypeError, ValueError):
+        unrealized_pl_value = None
+
+    computed_value = None
+    if cost_basis_value not in (None, 0) and unrealized_pl_value is not None:
+        computed_value = (unrealized_pl_value / cost_basis_value) * 100
+
+    if raw_value is None:
+        return computed_value if computed_value is not None else 0.0
+
+    if computed_value is None:
+        return raw_value * 100 if abs(raw_value) <= 1 else raw_value
+
+    if abs(raw_value) < 1e-9 and abs(computed_value) > 1e-6:
+        return computed_value
+
+    raw_delta = abs(raw_value - computed_value)
+    scaled_delta = abs((raw_value * 100) - computed_value)
+
+    if scaled_delta + 1e-6 < raw_delta:
+        return raw_value * 100
+
+    if raw_delta > max(1.0, abs(computed_value) * 0.5):
+        return computed_value
+
+    return raw_value
+
+def format_currency_display(value):
+    """Render currency-like numeric values with comma thousands separators."""
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return value
+
 def find_timestamp_candidate(obj):
     if isinstance(obj, dict):
         for key in ("asOfDate", "asof", "asof_ts", "asOf", "timestamp", "time", "date"):
@@ -209,8 +270,8 @@ def get_broker_asof_ts(broker, raw_payload, account_id=None):
 
 def store_snapshot_to_db(combined_data, raw_schwab_data, raw_ib_data):
     conn, error = get_db_connection()
-    if error:
-        st.error(error)
+    if error or conn is None:
+        st.error(error or "Failed to connect to Postgres.")
         return False
 
     ensure_snapshot_schema(conn)
@@ -639,15 +700,25 @@ def parse_schwab_data(raw_data):
                     or 0
                 )
                 avg_price = position.get("taxLotAverageLongPrice", position.get("averageLongPrice", 0)) or 0
+                market_value = float(position.get("marketValue", 0) or 0)
+                cost_basis = float(avg_price) * float(quantity)
+                unrealized_pl = float(
+                    position.get("longOpenProfitLoss", position.get("shortOpenProfitLoss", 0)) or 0
+                )
+                unrealized_pl_percent = normalize_unrealized_pl_percent(
+                    position.get("longOpenProfitLossPercent", position.get("shortOpenProfitLossPercent")),
+                    cost_basis,
+                    unrealized_pl
+                )
                 parsed_data["positions"].append({
                     "account_id": account_wrapper.get("accountNumber", "Unknown"),
                     "symbol": symbol,
                     "description": description,
                     "quantity": float(quantity),
-                    "market_value": float(position.get("marketValue", 0) or 0),
-                    "cost_basis": float(avg_price) * float(quantity),
-                    "unrealized_pl": float(position.get("longOpenProfitLoss", position.get("shortOpenProfitLoss", 0)) or 0),
-                    "unrealized_pl_percent": float(position.get("longOpenProfitLossPercent", position.get("shortOpenProfitLossPercent", 0)) or 0),
+                    "market_value": market_value,
+                    "cost_basis": cost_basis,
+                    "unrealized_pl": unrealized_pl,
+                    "unrealized_pl_percent": unrealized_pl_percent,
                     "currency": position_currency,
                     "asset_class": asset_class
                 })
@@ -664,6 +735,99 @@ def parse_schwab_data(raw_data):
 # Interactive Brokers Functions
 #######################################################
 
+def create_ib_session():
+    """Create a requests session for the local IB Gateway."""
+    session = requests.Session()
+    session.verify = False
+    return session
+
+def get_ib_sso_status(session, gateway_url):
+    """
+    Check whether the local gateway has an authenticated SSO session.
+
+    This is separate from the brokerage session behind `/iserver/*`.
+    """
+    try:
+        response = session.get(f"{gateway_url}/sso/validate")
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("RESULT"):
+            return payload
+    except requests.exceptions.RequestException:
+        return None
+    return None
+
+def extract_ib_auth_status(payload):
+    """
+    Normalize auth status across `/iserver/auth/status` and `/tickle` payloads.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if "authenticated" in payload:
+        return payload
+
+    iserver = payload.get("iserver", {})
+    if isinstance(iserver, dict):
+        auth_status = iserver.get("authStatus")
+        if isinstance(auth_status, dict):
+            return auth_status
+    return None
+
+def fetch_ib_brokerage_status(session, gateway_url):
+    """
+    Read brokerage auth status using the most reliable endpoint available.
+    """
+    request_errors = []
+    last_http_status = None
+
+    endpoints = [
+        f"{gateway_url}/v1/api/iserver/auth/status",
+        f"{gateway_url}/v1/api/tickle",
+    ]
+
+    for endpoint in endpoints:
+        try:
+            response = session.get(endpoint)
+            last_http_status = response.status_code
+            if response.status_code != 200:
+                continue
+
+            payload = response.json()
+            status_data = extract_ib_auth_status(payload)
+            if status_data:
+                return status_data, last_http_status, None
+        except requests.exceptions.RequestException as exc:
+            request_errors.append(str(exc))
+
+    error_message = "; ".join(request_errors) if request_errors else None
+    return None, last_http_status, error_message
+
+def prepare_ib_gateway_session(session, gateway_url, retries=3, delay_seconds=1.0):
+    """
+    Try to promote a successful gateway login into a usable brokerage session.
+    """
+    sso_status = get_ib_sso_status(session, gateway_url)
+    http_status = None
+    error_message = None
+
+    for attempt in range(retries):
+        status_data, http_status, error_message = fetch_ib_brokerage_status(session, gateway_url)
+        if status_data:
+            return status_data, sso_status, http_status, error_message
+
+        should_try_reauth = sso_status is not None and http_status in (None, 404)
+        if should_try_reauth:
+            try:
+                session.post(f"{gateway_url}/v1/api/iserver/reauthenticate")
+            except requests.exceptions.RequestException as exc:
+                error_message = str(exc)
+
+        if attempt < retries - 1:
+            time.sleep(delay_seconds)
+
+    return None, sso_status, http_status, error_message
+
 def connect_to_ib():
     """
     Connect to the Interactive Brokers Client Portal API
@@ -678,28 +842,41 @@ def connect_to_ib():
     """
     # Base URL for the IB Client Portal API Gateway
     IB_GATEWAY_URL = f"https://{IB_HOST}:{IB_GATEWAY_PORT}"
-    session = requests.Session()
-    session.verify = False
+    session = create_ib_session()
 
     try:
-        # Check if the gateway is running and authenticated
-        auth_status_url = f"{IB_GATEWAY_URL}/v1/api/iserver/auth/status"
-        
-        # Make the request - we use verify=False because the gateway uses a self-signed certificate
-        response = session.get(auth_status_url)
-        
-        # Check if request was successful
-        if response.status_code == 401:
+        status_data, sso_status, http_status, error_message = prepare_ib_gateway_session(
+            session, IB_GATEWAY_URL
+        )
+
+        if status_data is None and sso_status is None and http_status == 401:
             st.warning("Interactive Brokers API session is not authenticated. Log in at the gateway UI first.")
             st.info(f"Open {IB_GATEWAY_URL} in your browser, log in, then try connecting again.")
             return None
-        if response.status_code != 200:
-            st.error(f"Error connecting to IB Gateway: HTTP {response.status_code}")
+
+        if status_data is None and sso_status is not None:
+            if http_status == 404:
+                st.warning(
+                    "IB Gateway login succeeded, but the brokerage session is not ready yet. "
+                    "The app will need the `/iserver` endpoints to come online before it can load portfolio data."
+                )
+            else:
+                st.warning(
+                    "IB Gateway login succeeded, but the brokerage session is still warming up."
+                )
+            if error_message:
+                st.info(f"Last gateway error: {error_message}")
             return None
-        
-        # Parse the response
-        status_data = response.json()
-        
+
+        if status_data is None:
+            if http_status is not None:
+                st.error(f"Error connecting to IB Gateway: HTTP {http_status}")
+            elif error_message:
+                st.error(f"Error connecting to IB Gateway: {error_message}")
+            else:
+                st.error("Error connecting to IB Gateway.")
+            return None
+
         # Check if authenticated
         if not status_data.get("authenticated", False):
             st.warning("IB Gateway is running but not authenticated. Please log in through the gateway.")
@@ -878,9 +1055,15 @@ def get_ib_account_data():
         
         st.session_state["ib_last_account_count"] = len(account_ids)
         st.session_state["ib_last_position_count"] = len(account_data["positions"])
-        st.session_state["ib_last_currencies"] = sorted({
-            pos.get("currency") for pos in account_data["positions"] if isinstance(pos, dict) and pos.get("currency")
-        })
+        st.session_state["ib_last_currencies"] = sorted(
+            {
+                currency
+                for pos in account_data["positions"]
+                if isinstance(pos, dict)
+                and isinstance((currency := pos.get("currency")), str)
+                and currency
+            }
+        )
 
         # Return the complete data
         return account_data
@@ -1024,9 +1207,11 @@ def parse_ib_data(ib_data):
             unrealized_pl = position.get("unrealizedPnl")
             if unrealized_pl is None:
                 unrealized_pl = market_value - cost_basis
-            unrealized_pl_percent = position.get("unrealizedPnlPct")
-            if unrealized_pl_percent is None:
-                unrealized_pl_percent = (unrealized_pl / cost_basis * 100) if cost_basis else 0
+            unrealized_pl_percent = normalize_unrealized_pl_percent(
+                position.get("unrealizedPnlPct"),
+                cost_basis,
+                unrealized_pl
+            )
             
             # Add position details to the positions array
             symbol = position.get("symbol") or position.get("ticker") or position.get("contractDesc") or "Unknown"
@@ -1068,7 +1253,7 @@ def parse_ib_data(ib_data):
         st.error(f"Error parsing IB data: {str(e)}")
         return None
 
-def get_ib_status():
+def get_ib_status(gateway_url=None, session=None):
     """
     Fetch authentication status and basic account details from IB Gateway
 
@@ -1076,38 +1261,63 @@ def get_ib_status():
     - dict: status info with auth flags, server version, and account IDs
     - None: if the gateway is unreachable
     """
-    gateway_url = st.session_state.get("ib_gateway_url")
-    session = st.session_state.get("ib_session")
+    gateway_url = gateway_url or st.session_state.get("ib_gateway_url")
+    if gateway_url is None:
+        gateway_url = f"https://{IB_HOST}:{IB_GATEWAY_PORT}"
+
+    session = session or st.session_state.get("ib_session")
     if not gateway_url:
         return None
     if session is None:
-        session = requests.Session()
-        session.verify = False
+        session = create_ib_session()
 
-    status_url = f"{gateway_url}/v1/api/iserver/auth/status"
-    status_response = session.get(status_url)
-    if status_response.status_code != 200:
+    try:
+        status_data, http_status, error_message = fetch_ib_brokerage_status(session, gateway_url)
+        sso_status = get_ib_sso_status(session, gateway_url)
+
+        if status_data is None:
+            if sso_status is not None:
+                message = "Gateway login is complete, but the brokerage session is not ready yet."
+                if http_status == 404:
+                    message = "Gateway login is complete, but the `/iserver` API is not available yet."
+            else:
+                message = "IB Gateway responded but authentication is not established."
+            return {
+                "http_status": http_status,
+                "authenticated": False,
+                "connected": False,
+                "message": message,
+                "sso_validated": sso_status is not None,
+                "request_error": error_message,
+            }
+    except requests.exceptions.ConnectionError:
+        return None
+    except requests.exceptions.RequestException as exc:
         return {
-            "http_status": status_response.status_code,
+            "http_status": None,
             "authenticated": False,
             "connected": False,
-            "message": "IB Gateway responded but authentication is not established."
+            "message": f"IB Gateway request failed: {exc}",
+            "sso_validated": False,
         }
-    status_data = status_response.json()
 
     accounts = []
     accounts_url = f"{gateway_url}/v1/api/iserver/accounts"
-    accounts_response = session.get(accounts_url)
-    if accounts_response.status_code == 200:
-        accounts_payload = accounts_response.json()
-        if isinstance(accounts_payload, dict) and "accounts" in accounts_payload:
-            accounts = accounts_payload.get("accounts", [])
-        elif isinstance(accounts_payload, list):
-            accounts = accounts_payload
-        else:
-            accounts = [accounts_payload]
+    try:
+        accounts_response = session.get(accounts_url)
+        if accounts_response.status_code == 200:
+            accounts_payload = accounts_response.json()
+            if isinstance(accounts_payload, dict) and "accounts" in accounts_payload:
+                accounts = accounts_payload.get("accounts", [])
+            elif isinstance(accounts_payload, list):
+                accounts = accounts_payload
+            else:
+                accounts = [accounts_payload]
+    except requests.exceptions.RequestException:
+        accounts = []
 
     status_data["accounts"] = accounts
+    status_data["sso_validated"] = sso_status is not None
     return status_data
 
 def fetch_company_name_for_conid(session, gateway_url, conid):
@@ -1154,6 +1364,8 @@ def fetch_contract_metadata(session, gateway_url, conid):
 
     payload = response.json()
     item = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(item, dict):
+        item = {}
     metadata = {
         "instrument_type": item.get("instrument_type"),
         "trading_class": item.get("trading_class")
@@ -1392,10 +1604,15 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         session = requests.Session()
         session.verify = False
 
-    currencies = sorted({
-        pos.get("currency") for pos in filtered_data["positions"]
-        if isinstance(pos, dict) and pos.get("currency")
-    })
+    currencies = sorted(
+        {
+            currency
+            for pos in filtered_data["positions"]
+            if isinstance(pos, dict)
+            and isinstance((currency := pos.get("currency")), str)
+            and currency
+        }
+    )
     fx_rates = {}
     fx_rates_gbp = {}
     fx_rates_usd = {}
@@ -1464,26 +1681,84 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
         )
 
     total_value = display_total_value
-    st.metric("Portfolio Value", f"{total_value:,.2f}", display_currency)
-    
-    # Create a row with three columns for summary metrics
-    # st.columns creates a layout with the specified number of equal-width columns
-    col1, col2, col3 = st.columns(3)
-    
+
     # Count positions and calculate average position value
     num_positions = len(filtered_data["positions"])
     # Avoid division by zero by checking if num_positions is zero
     avg_position_value = total_value / num_positions if num_positions > 0 else 0
-    
-    # Display metrics in the columns
-    # The with statement places content in the specified column
-    with col1:
-        st.metric("Number of Positions", f"{num_positions}", "")
-    with col2:
-        st.metric("Average Position Size", f"{avg_position_value:,.2f}", "")
-    with col3:
-        # This would be calculated from historical data in a real app
-        st.metric("YTD Return", "N/A", "")
+
+    st.markdown(
+        """
+        <style>
+        .portfolio-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.75rem 1.5rem;
+            margin: 0.25rem 0 1.25rem 0;
+        }
+        .portfolio-summary-card {
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            padding: 0.25rem 0;
+        }
+        .portfolio-summary-label {
+            color: var(--secondary-text-color);
+            font-size: 0.95rem;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+        .portfolio-summary-value {
+            color: var(--text-color);
+            font-size: 1.9rem;
+            font-weight: 700;
+            line-height: 1.1;
+            white-space: nowrap;
+        }
+        .portfolio-summary-suffix {
+            color: var(--secondary-text-color);
+            font-size: 1rem;
+            font-weight: 600;
+            margin-left: 0.35rem;
+        }
+        @media (max-width: 1100px) {
+            .portfolio-summary-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        @media (max-width: 700px) {
+            .portfolio-summary-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+        <div class="portfolio-summary-grid">
+            <div class="portfolio-summary-card">
+                <span class="portfolio-summary-label">Portfolio Value</span>
+                <span class="portfolio-summary-value">{total_value:,.2f}<span class="portfolio-summary-suffix">{display_currency}</span></span>
+            </div>
+            <div class="portfolio-summary-card">
+                <span class="portfolio-summary-label">Number of Positions</span>
+                <span class="portfolio-summary-value">{num_positions}</span>
+            </div>
+            <div class="portfolio-summary-card">
+                <span class="portfolio-summary-label">Average Position Size</span>
+                <span class="portfolio-summary-value">{avg_position_value:,.2f}<span class="portfolio-summary-suffix">{display_currency}</span></span>
+            </div>
+            <div class="portfolio-summary-card">
+                <span class="portfolio-summary-label">YTD Return</span>
+                <span class="portfolio-summary-value">N/A</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Display breakdown by broker if showing all accounts
     if view_type == "all":
@@ -1594,18 +1869,20 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     
     # Format the Percentage column with one decimal place
     df_accounts["Percentage"] = df_accounts["Percentage"].map("{:.1f}%".format)
+    for currency_column in (
+        account_value_label,
+        account_value_usd_label,
+        account_value_gbp_label,
+    ):
+        if currency_column in df_accounts.columns:
+            df_accounts[currency_column] = df_accounts[currency_column].map(format_currency_display)
     
     # Display accounts table
     # st.dataframe displays a DataFrame as an interactive table
     # use_container_width=True makes the table fill the available width
     st.dataframe(
         df_accounts,
-        use_container_width=True,
-        column_config={
-            account_value_label: st.column_config.NumberColumn(format="localized", step=0.01),
-            account_value_usd_label: st.column_config.NumberColumn(format="localized", step=0.01),
-            account_value_gbp_label: st.column_config.NumberColumn(format="localized", step=0.01)
-        }
+        use_container_width=True
     )
     
     # Display asset allocation
@@ -1731,19 +2008,6 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # Prepare positions data for display
     positions_data = []
     def get_exchange(position):
-        exchs = position.get("exchs")
-        if isinstance(exchs, str) and exchs.strip():
-            return exchs
-        if isinstance(exchs, list) and exchs:
-            return ",".join(exchs)
-        con_exch_map = position.get("conExchMap")
-        if isinstance(con_exch_map, list) and con_exch_map:
-            first = con_exch_map[0]
-            if isinstance(first, dict):
-                return first.get("exch") or first.get("exchange") or first.get("name")
-        return position.get("listingExchange") or position.get("exchange")
-
-    def get_exchange(position):
         exchange = position.get("exchange")
         if isinstance(exchange, str) and exchange.strip():
             return exchange
@@ -1834,20 +2098,22 @@ def display_portfolio_summary(combined_data, view_type="all", display_currency="
     # Format % P/L with two decimal places
     if "Unrealized P&L (%)" in df_positions.columns:
         df_positions["Unrealized P&L (%)"] = df_positions["Unrealized P&L (%)"].map("{:.2f}%".format)
+    for currency_column in (
+        market_value_base_label,
+        cost_basis_base_label,
+        unrealized_base_label,
+        converted_label,
+        usd_value_label,
+        converted_pnl_label,
+        usd_pnl_label,
+    ):
+        if currency_column in df_positions.columns:
+            df_positions[currency_column] = df_positions[currency_column].map(format_currency_display)
     
     # Display positions table
     st.dataframe(
         df_positions,
-        use_container_width=True,
-        column_config={
-            market_value_base_label: st.column_config.NumberColumn(format="localized", step=0.01),
-            cost_basis_base_label: st.column_config.NumberColumn(format="localized", step=0.01),
-            unrealized_base_label: st.column_config.NumberColumn(format="localized", step=0.01),
-            converted_label: st.column_config.NumberColumn(format="localized", step=0.01),
-            usd_value_label: st.column_config.NumberColumn(format="localized", step=0.01),
-            converted_pnl_label: st.column_config.NumberColumn(format="localized", step=0.01),
-            usd_pnl_label: st.column_config.NumberColumn(format="localized", step=0.01)
-        }
+        use_container_width=True
     )
 
 def filter_portfolio_data(combined_data, view_type):
@@ -2000,11 +2266,11 @@ def display_example_dashboard():
     # - Label for the radio button group
     # - List of options
     # - horizontal=True displays options horizontally instead of vertically
-    view_option = st.radio(
+    view_option = cast(str, st.radio(
         "Select view:",
         ["All Accounts", "Schwab Only", "Interactive Brokers ISA Only"],
         horizontal=True
-    )
+    ))
     
     # Map the selected option to the view_type parameter
     view_mapping = {
@@ -2014,7 +2280,7 @@ def display_example_dashboard():
     }
     
     # Display the portfolio summary with the selected view type
-    display_portfolio_summary(example_data, view_mapping[view_option])
+    display_portfolio_summary(example_data, view_mapping.get(view_option, "all"))
 
 #######################################################
 # Main Streamlit App
@@ -2151,32 +2417,84 @@ with tab2:
         st.info("To connect to Interactive Brokers, you need to set up the IB API Gateway. See the Help tab for setup steps.")
         
         ib_gateway_url = f"https://{IB_HOST}:{IB_GATEWAY_PORT}"
-        st.markdown(
-            f'<a href="{ib_gateway_url}" target="_self">Open IB Gateway login (same tab)</a>',
-            unsafe_allow_html=True
+        ib_gateway_status = get_ib_status(ib_gateway_url)
+        ib_auth_watch_active = st.session_state.get("ib_auth_watch_active", False)
+        st.warning(
+            "IB Gateway uses a self-signed certificate on localhost. "
+            "Your browser will likely warn that the connection is not private; "
+            "for this local gateway that is expected."
         )
-        st.markdown(
-            '<a href="/" target="_self">Return to Streamlit app</a>',
-            unsafe_allow_html=True
+        if st.button("Open IB Gateway login in a new tab"):
+            st.session_state["ib_auth_watch_active"] = True
+            components.html(
+                f"""
+                <script>
+                window.open("{ib_gateway_url}", "_blank", "noopener,noreferrer");
+                </script>
+                """,
+                height=0,
+            )
+            st.info("Opened the IB Gateway login page in a new tab. Complete the login there; this page will keep checking for readiness.")
+
+        st.caption(
+            "When the gateway page says 'Client login succeeds', return to this app tab. "
+            "IB authenticates the local gateway itself, not Streamlit directly, so there is no app callback URL to receive here."
         )
 
-        # Add a button to connect
-        if st.button("Connect to Interactive Brokers"):
-            # Try to connect
-            ib_client = connect_to_ib()
-            
-            # If connection was successful
-            if ib_client:
-                st.success("Successfully connected to Interactive Brokers!")
-                
-                # Store the client object in session state
-                st.session_state["ib_client"] = ib_client
-                
-                # Rerun the app to update the UI
+        if ib_gateway_status is None:
+            st.warning("IB Gateway is not reachable yet. Start the gateway and then refresh the status below.")
+        elif ib_gateway_status.get("authenticated") and ib_gateway_status.get("connected"):
+            st.success("IB Gateway login is complete and the gateway is ready.")
+            if ib_auth_watch_active:
+                ib_client = connect_to_ib()
+                if ib_client:
+                    st.session_state["ib_client"] = ib_client
+                    st.session_state["ib_auth_watch_active"] = False
+                    st.rerun()
+        elif ib_gateway_status.get("authenticated"):
+            st.warning("IB Gateway login is complete, but the gateway is not yet connected to IB servers.")
+        else:
+            status_message = ib_gateway_status.get("message", "IB Gateway is reachable but not yet authenticated.")
+            st.info(status_message)
+
+        if ib_auth_watch_active and not st.session_state.get("ib_connected", False):
+            st.caption("Waiting for IB Gateway login to complete. This page refreshes automatically every 3 seconds while watch mode is active.")
+            components.html(
+                """
+                <script>
+                setTimeout(function () {
+                    window.parent.location.reload();
+                }, 3000);
+                </script>
+                """,
+                height=0,
+            )
+
+        if st.button("Refresh IB Gateway status"):
+            st.rerun()
+
+        if ib_auth_watch_active:
+            if st.button("Stop watching IB Gateway login"):
+                st.session_state["ib_auth_watch_active"] = False
                 st.rerun()
-            else:
-                # If connection failed, show error
-                st.error("Failed to connect to Interactive Brokers. Check your credentials and make sure the IB Gateway is running.")
+        else:
+            # Manual fallback if you did not launch the login from this page.
+            if st.button("Connect to Interactive Brokers now"):
+                # Try to connect
+                ib_client = connect_to_ib()
+                
+                # If connection was successful
+                if ib_client:
+                    st.success("Successfully connected to Interactive Brokers!")
+                    
+                    # Store the client object in session state
+                    st.session_state["ib_client"] = ib_client
+                    
+                    # Rerun the app to update the UI
+                    st.rerun()
+                else:
+                    # If connection failed, show error
+                    st.error("Failed to connect to Interactive Brokers. Check your credentials and make sure the IB Gateway is running.")
 
     # Server status panel (generic)
     with st.expander("Server Status", expanded=True):
@@ -2233,15 +2551,15 @@ with tab2:
 with tab1:
     st.header("Portfolio Summary")
 
-    display_currency = st.sidebar.radio(
+    display_currency = cast(str, st.sidebar.radio(
         "Display currency",
         ["GBP", "USD"],
         index=0
-    )
-    view_option = st.sidebar.radio(
+    ))
+    view_option = cast(str, st.sidebar.radio(
         "Select view",
         ["All Accounts", "Schwab Only", "Interactive Brokers ISA Only"]
-    )
+    ))
 
     snapshots = st.session_state.get("portfolio_snapshots", [])
     latest_snapshot = snapshots[-1] if snapshots else None
@@ -2334,7 +2652,8 @@ with tab1:
         }
         
         # Display the portfolio summary with the selected view type
-        display_portfolio_summary(combined_data, view_mapping[view_option], display_currency=display_currency)
+        selected_view = view_mapping.get(view_option, "all")
+        display_portfolio_summary(combined_data, selected_view, display_currency=display_currency)
 
         if store_snapshot_clicked:
             raw_schwab = st.session_state.get("raw_schwab_data")
@@ -2385,10 +2704,15 @@ with tab1:
                 if session is None:
                     session = requests.Session()
                     session.verify = False
-                currencies = sorted({
-                    pos.get("currency") for pos in combined_data.get("positions", [])
-                    if isinstance(pos, dict) and pos.get("currency")
-                })
+                currencies = sorted(
+                    {
+                        currency
+                        for pos in combined_data.get("positions", [])
+                        if isinstance(pos, dict)
+                        and isinstance((currency := pos.get("currency")), str)
+                        and currency
+                    }
+                )
                 for currency in currencies:
                     fetch_fx_rate(session, gateway_url, "GBP", currency)
                     fetch_fx_rate(session, gateway_url, "USD", currency)
@@ -2405,10 +2729,13 @@ with tab1:
                 if session is None:
                     session = requests.Session()
                     session.verify = False
-                conids = sorted({
-                    pos.get("conid") for pos in combined_data.get("positions", [])
-                    if isinstance(pos, dict) and pos.get("conid")
-                })
+                conids = sorted(
+                    {
+                        str(conid)
+                        for pos in combined_data.get("positions", [])
+                        if isinstance(pos, dict) and (conid := pos.get("conid")) is not None
+                    }
+                )
                 for conid in conids:
                     fetch_contract_metadata(session, gateway_url, conid)
                     fetch_company_name_for_conid(session, gateway_url, conid)
@@ -2435,8 +2762,8 @@ with tab3:
     st.caption("Read-only views into Postgres for snapshots and positions.")
 
     conn, error = get_db_connection()
-    if error:
-        st.error(error)
+    if error or conn is None:
+        st.error(error or "Failed to connect to Postgres.")
     else:
         try:
             with conn.cursor() as cur:
@@ -2455,16 +2782,22 @@ with tab3:
             else:
                 table_name = st.selectbox("Select a table", tables)
                 limit = st.number_input("Row limit", min_value=10, max_value=1000, value=200, step=10)
+                table_identifier = sql.Identifier(table_name)
 
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT COUNT(*) FROM {table_name}")
-                    row_count = cur.fetchone()[0]
+                    cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(table_identifier))
+                    row_count_result = cur.fetchone()
+                    row_count = row_count_result[0] if row_count_result else 0
                 st.caption(f"Total rows: {row_count}")
 
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT * FROM {table_name} ORDER BY 1 DESC LIMIT %s", (int(limit),))
+                    cur.execute(
+                        sql.SQL("SELECT * FROM {} ORDER BY 1 DESC LIMIT %s").format(table_identifier),
+                        (int(limit),)
+                    )
                     rows = cur.fetchall()
-                    colnames = [desc[0] for desc in cur.description]
+                    description = cur.description or []
+                    colnames = [desc[0] for desc in description]
 
                 df_preview = pd.DataFrame(rows, columns=colnames)
                 st.dataframe(df_preview, use_container_width=True)
@@ -2478,7 +2811,8 @@ with tab3:
                                 "SELECT run_id, started_at, status FROM snapshot_runs ORDER BY started_at DESC LIMIT 10"
                             )
                             rows = cur.fetchall()
-                            cols = [desc[0] for desc in cur.description]
+                            description = cur.description or []
+                            cols = [desc[0] for desc in description]
                         st.write("Latest snapshot runs")
                         st.dataframe(pd.DataFrame(rows, columns=cols), use_container_width=True)
                 with col_b:
@@ -2488,7 +2822,8 @@ with tab3:
                                 "SELECT broker, broker_account_id, asof_ts, total_value_local FROM snapshots ORDER BY asof_ts DESC LIMIT 10"
                             )
                             rows = cur.fetchall()
-                            cols = [desc[0] for desc in cur.description]
+                            description = cur.description or []
+                            cols = [desc[0] for desc in description]
                         st.write("Latest snapshots")
                         st.dataframe(pd.DataFrame(rows, columns=cols), use_container_width=True)
         except Exception as exc:
@@ -2525,13 +2860,15 @@ with tab4:
         st.write("""
         1. Download and install the IB API Gateway from the Interactive Brokers website
         2. Configure the gateway with your account credentials
-        3. Start the gateway and ensure it's running on port 5001
+        3. Start the gateway and ensure it's running on port 5002
         4. Add your IB settings to your .env file:
            ```
-           IB_GATEWAY_PORT=5001
+           IB_GATEWAY_PORT=5002
            IB_HOST=127.0.0.1
            ```
-        5. Click "Connect to Interactive Brokers" in the Authentication tab
+        5. Click "Open IB Gateway login in a new tab" in the Authentication tab
+        6. Complete the IB login in the gateway tab
+        7. Return to the app tab and wait for it to connect automatically
         """)
     
     # Create an expandable section for Schwab connection issues
@@ -2560,13 +2897,14 @@ with tab4:
         
         1. Install the IB API Gateway
         2. Configure it with your IB account credentials
-        3. Start the gateway and ensure it's running on port 5001
+        3. Start the gateway and ensure it's running on port 5002
         4. Add your IB credentials to the .env file
-        5. Click "Connect to Interactive Brokers" in the Authentication tab
+        5. Open the gateway login page in a new tab and complete the login there
+        6. Return to the app and let it auto-connect once the gateway is authenticated
         
         If you're having trouble:
         - Check that the IB Gateway is running
-        - Verify that your Client ID is correct in the .env file
+        - Expect a browser warning about the gateway's self-signed localhost certificate
         - Make sure the gateway is configured to accept connections from localhost
         """)
     
