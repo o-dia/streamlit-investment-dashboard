@@ -65,6 +65,7 @@ SCHWAB_REDIRECT_URI=https://your-ngrok-url.ngrok-free.app
 
 IB_HOST=127.0.0.1
 IB_GATEWAY_PORT=5002
+IB_GATEWAY_DIR=~/Applications/clientportal.gw
 
 DATABASE_URL=postgres://<db_user>:<db_password>@localhost:5432/investment_dashboard
 ```
@@ -72,7 +73,8 @@ DATABASE_URL=postgres://<db_user>:<db_password>@localhost:5432/investment_dashbo
 Notes:
 
 - `SCHWAB_REDIRECT_URI` must exactly match the URL registered in the Schwab developer portal.
-- This repo’s bundled IB gateway config listens on port `5002`.
+- The app expects the IB Client Portal Gateway on `https://127.0.0.1:5002`.
+- `IB_GATEWAY_DIR` is optional and is used by the repo launcher script, not by the Streamlit app itself.
 - The app reads `DATABASE_URL` directly from `.env`.
 
 ## Set Up Postgres
@@ -132,24 +134,42 @@ curl -s http://127.0.0.1:4040/api/tunnels
 
 If you want Interactive Brokers data:
 
-1. Start the Client Portal Gateway.
-2. In the app, use `Open IB Gateway login in a new tab`.
-3. Expect a browser warning about the gateway's self-signed localhost certificate.
-4. Complete the login in the gateway tab.
-5. Return to the app tab and let it auto-connect.
-
-If you are using the gateway files included in this repo:
+1. Install the Client Portal Gateway outside this repo, ideally at `~/Applications/clientportal.gw`.
+2. Start it from the repo root with:
 
 ```bash
-cd clientportal.gw
-./bin/run.sh ./root/conf.yaml
+./scripts/start_ib_gateway.sh
 ```
 
-That config listens on:
+3. If you installed it somewhere else, set `IB_GATEWAY_DIR` in `.env` first.
+4. In the app, use `Open IB Gateway login in a new tab`.
+5. Expect a browser warning about the gateway's self-signed localhost certificate.
+6. Complete the login in the gateway tab.
+7. Return to the app tab and let it auto-connect.
+
+The helper script defaults to:
+
+```text
+~/Applications/clientportal.gw
+```
+
+That gateway should listen on:
 
 ```text
 https://127.0.0.1:5002
 ```
+
+If you already have a local gateway copy inside the repo from older setup steps, move it out of the repo and keep using the launcher script from the project root.
+
+## Returning To The Project Later
+
+This README is meant to help new users clone and run the project for the first time.
+
+If you are coming back to this repo on the original development machine and want the exact local run order, terminal layout, ngrok checks, gateway checks, and service commands, use:
+
+- [LOCAL_STARTUP.md](LOCAL_STARTUP.md)
+
+That file is the project-specific operator runbook.
 
 ## Database Behavior
 
@@ -160,16 +180,6 @@ That means:
 - a newly created `investment_dashboard` database may start empty
 - tables appear after you load portfolio data and click `Store snapshot`
 - the `DB Explorer` tab is a convenient read-only way to inspect stored tables and rows
-
-## Returning To The Project Later
-
-This README is meant to help new users clone and run the project for the first time.
-
-If you are coming back to this repo on the original development machine and want the exact local run order, terminal layout, ngrok checks, and service commands, use:
-
-- [LOCAL_STARTUP.md](LOCAL_STARTUP.md)
-
-That file is the project-specific operator runbook.
 
 ## Development Status
 

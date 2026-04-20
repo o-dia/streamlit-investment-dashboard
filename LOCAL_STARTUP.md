@@ -14,7 +14,7 @@ For normal local use, there are three moving parts:
 
 `ngrok` is separate. It only matters for Schwab OAuth, and on this laptop it is configured as a background macOS LaunchAgent, so you do not usually keep a terminal open for it.
 
-## Current Repo Assumptions
+## Current Local Assumptions
 
 These are the values the app currently expects:
 
@@ -23,8 +23,9 @@ These are the values the app currently expects:
 - Database name: `investment_dashboard`
 - IB Gateway host: `127.0.0.1`
 - IB Gateway port: `5002`
+- Recommended IB Gateway install directory: `~/Applications/clientportal.gw`
 
-The IB port is `5002` because both `.env` and `clientportal.gw/root/conf.yaml` use `5002`.
+The IB port is `5002` because the app expects `https://127.0.0.1:5002`.
 
 ## Before You Start
 
@@ -41,7 +42,26 @@ Check `.env` before launching anything:
 - `DATABASE_URL` should point to `investment_dashboard` on `localhost:5432`
 - `IB_HOST` should be `127.0.0.1`
 - `IB_GATEWAY_PORT` should be `5002`
+- `IB_GATEWAY_DIR` should point to your local Client Portal Gateway install if you are not using `~/Applications/clientportal.gw`
 - `SCHWAB_REDIRECT_URI` should exactly match the current ngrok public URL if you want Schwab auth to work
+
+## Recommended Gateway Layout
+
+Keep the IB Client Portal Gateway outside this repo so logs, runtime files, and keystores never mix with project files.
+
+Recommended path:
+
+```text
+~/Applications/clientportal.gw
+```
+
+If you already have a local copy in this repo from the older setup, move it once to that location, then keep starting it from the repo root with:
+
+```bash
+./scripts/start_ib_gateway.sh
+```
+
+The launcher script reads `IB_GATEWAY_DIR` from your shell or `.env`. If that is missing, it falls back to `~/Applications/clientportal.gw`.
 
 ## Terminal Layout
 
@@ -66,14 +86,21 @@ If you just want to confirm the UI loads, the app can open without broker connec
 ### Terminal 2: Start Interactive Brokers Gateway
 
 ```bash
-cd /Users/Omar/Coding/Python/Streamlit/clientportal.gw
-./bin/run.sh ./root/conf.yaml
+cd /Users/Omar/Coding/Python/Streamlit
+./scripts/start_ib_gateway.sh
 ```
 
 What to expect:
 
 - the gateway should listen on `https://127.0.0.1:5002`
 - you may need to open that URL in a browser and log in before the app can connect
+
+Useful checks if you reopened VS Code and are not sure whether it is still running:
+
+```bash
+lsof -nP -iTCP:5002 -sTCP:LISTEN
+pgrep -af 'clientportal|GatewayStart'
+```
 
 Once the gateway is authenticated:
 
@@ -211,7 +238,7 @@ Use this when you want the shortest path:
 
 1. Start Postgres: `brew services start postgresql@16`
 2. Confirm the DB exists: `psql -h localhost -U Omar -l`
-3. Start IB Gateway: `cd clientportal.gw && ./bin/run.sh ./root/conf.yaml`
+3. Start IB Gateway: `./scripts/start_ib_gateway.sh`
 4. Check ngrok URL: `curl -s http://127.0.0.1:4040/api/tunnels`
 5. Make sure `.env` has the same `SCHWAB_REDIRECT_URI`
 6. Start the app: `streamlit run app.py`
@@ -228,6 +255,7 @@ If the app opens but DB Explorer is empty:
 If Interactive Brokers will not connect:
 
 - confirm the gateway is running on `https://127.0.0.1:5002`
+- if needed, check the process with `pgrep -af 'clientportal|GatewayStart'`
 - expect the browser to warn about the gateway's self-signed localhost certificate
 - log in to the gateway in the browser first
 - then return to the app tab and give it a few seconds to auto-connect

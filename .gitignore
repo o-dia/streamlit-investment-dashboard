@@ -4,8 +4,7 @@
 .DS_Store
 **/.DS_Store
 
-# IB Client Portal Gateway runtime artifacts
-clientportal.gw/logs/
-clientportal.gw/.vertx/
-clientportal.gw/root/vertx.jks
-clientportal.gw/**/vertx.jks
+# Keep any local IB Client Portal Gateway install out of git.
+# Recommended location is outside the repo, but this also protects
+# against accidentally unpacking it in the project root again.
+clientportal.gw/

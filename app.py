@@ -2858,14 +2858,15 @@ with tab4:
     # Create an expandable section for IB setup instructions
     with st.expander("Interactive Brokers Setup Instructions"):
         st.write("""
-        1. Download and install the IB API Gateway from the Interactive Brokers website
-        2. Configure the gateway with your account credentials
-        3. Start the gateway and ensure it's running on port 5002
-        4. Add your IB settings to your .env file:
+        1. Download and install the IB Client Portal Gateway from the Interactive Brokers website
+        2. Keep it outside this repo, ideally at `~/Applications/clientportal.gw`
+        3. Add your IB settings to your `.env` file:
            ```
            IB_GATEWAY_PORT=5002
            IB_HOST=127.0.0.1
+           IB_GATEWAY_DIR=~/Applications/clientportal.gw
            ```
+        4. Start the gateway from the repo root with `./scripts/start_ib_gateway.sh`
         5. Click "Open IB Gateway login in a new tab" in the Authentication tab
         6. Complete the IB login in the gateway tab
         7. Return to the app tab and wait for it to connect automatically
@@ -2895,15 +2896,14 @@ with tab4:
         st.write("""
         To connect to Interactive Brokers:
         
-        1. Install the IB API Gateway
-        2. Configure it with your IB account credentials
-        3. Start the gateway and ensure it's running on port 5002
-        4. Add your IB credentials to the .env file
-        5. Open the gateway login page in a new tab and complete the login there
-        6. Return to the app and let it auto-connect once the gateway is authenticated
+        1. Install the IB Client Portal Gateway outside this repo
+        2. Set `IB_GATEWAY_DIR` in `.env` if you did not install it at `~/Applications/clientportal.gw`
+        3. Start it with `./scripts/start_ib_gateway.sh`
+        4. Open the gateway login page in a new tab and complete the login there
+        5. Return to the app and let it auto-connect once the gateway is authenticated
         
         If you're having trouble:
-        - Check that the IB Gateway is running
+        - Check that the IB Gateway is running on `https://127.0.0.1:5002`
         - Expect a browser warning about the gateway's self-signed localhost certificate
         - Make sure the gateway is configured to accept connections from localhost
         """)
