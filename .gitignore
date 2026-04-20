@@ -1,1 +1,11 @@
 .env
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# IB Client Portal Gateway runtime artifacts
+clientportal.gw/logs/
+clientportal.gw/.vertx/
+clientportal.gw/root/vertx.jks
+clientportal.gw/**/vertx.jks
