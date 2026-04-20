@@ -268,6 +268,30 @@ def get_broker_asof_ts(broker, raw_payload, account_id=None):
     parsed = parse_timestamp(candidate)
     return parsed if parsed else datetime.now(timezone.utc)
 
+def make_arrow_compatible_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert DataFrame values that Streamlit Arrow serialization cannot infer.
+
+    Psycopg returns UUID columns as native Python UUID objects. Streamlit can
+    display them, but Arrow serialization emits warnings unless they are first
+    normalized to strings.
+    """
+    if df.empty:
+        return df
+
+    normalized = df.copy()
+    for column_name in normalized.columns:
+        series = normalized[column_name]
+        if series.dtype != "object":
+            continue
+
+        if series.map(lambda value: isinstance(value, uuid.UUID)).any():
+            normalized[column_name] = series.map(
+                lambda value: str(value) if isinstance(value, uuid.UUID) else value
+            )
+
+    return normalized
+
 def store_snapshot_to_db(combined_data, raw_schwab_data, raw_ib_data):
     conn, error = get_db_connection()
     if error or conn is None:
@@ -2799,7 +2823,7 @@ with tab3:
                     description = cur.description or []
                     colnames = [desc[0] for desc in description]
 
-                df_preview = pd.DataFrame(rows, columns=colnames)
+                df_preview = make_arrow_compatible_dataframe(pd.DataFrame(rows, columns=colnames))
                 st.dataframe(df_preview, use_container_width=True)
 
                 st.subheader("Quick views")
@@ -2814,7 +2838,10 @@ with tab3:
                             description = cur.description or []
                             cols = [desc[0] for desc in description]
                         st.write("Latest snapshot runs")
-                        st.dataframe(pd.DataFrame(rows, columns=cols), use_container_width=True)
+                        st.dataframe(
+                            make_arrow_compatible_dataframe(pd.DataFrame(rows, columns=cols)),
+                            use_container_width=True
+                        )
                 with col_b:
                     if "snapshots" in tables:
                         with conn.cursor() as cur:
@@ -2825,7 +2852,10 @@ with tab3:
                             description = cur.description or []
                             cols = [desc[0] for desc in description]
                         st.write("Latest snapshots")
-                        st.dataframe(pd.DataFrame(rows, columns=cols), use_container_width=True)
+                        st.dataframe(
+                            make_arrow_compatible_dataframe(pd.DataFrame(rows, columns=cols)),
+                            use_container_width=True
+                        )
         except Exception as exc:
             st.error(f"Failed to load DB explorer: {exc}")
         finally:
@@ -2859,12 +2889,12 @@ with tab4:
     with st.expander("Interactive Brokers Setup Instructions"):
         st.write("""
         1. Download and install the IB Client Portal Gateway from the Interactive Brokers website
-        2. Keep it outside this repo, ideally at `~/Applications/clientportal.gw`
+        2. Keep it outside this repo, ideally at `/Applications/clientportal.gw`
         3. Add your IB settings to your `.env` file:
            ```
            IB_GATEWAY_PORT=5002
            IB_HOST=127.0.0.1
-           IB_GATEWAY_DIR=~/Applications/clientportal.gw
+           IB_GATEWAY_DIR=/Applications/clientportal.gw
            ```
         4. Start the gateway from the repo root with `./scripts/start_ib_gateway.sh`
         5. Click "Open IB Gateway login in a new tab" in the Authentication tab
@@ -2897,7 +2927,7 @@ with tab4:
         To connect to Interactive Brokers:
         
         1. Install the IB Client Portal Gateway outside this repo
-        2. Set `IB_GATEWAY_DIR` in `.env` if you did not install it at `~/Applications/clientportal.gw`
+        2. Set `IB_GATEWAY_DIR` in `.env` if you did not install it at `/Applications/clientportal.gw`
         3. Start it with `./scripts/start_ib_gateway.sh`
         4. Open the gateway login page in a new tab and complete the login there
         5. Return to the app and let it auto-connect once the gateway is authenticated

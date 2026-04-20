@@ -65,7 +65,7 @@ SCHWAB_REDIRECT_URI=https://your-ngrok-url.ngrok-free.app
 
 IB_HOST=127.0.0.1
 IB_GATEWAY_PORT=5002
-IB_GATEWAY_DIR=~/Applications/clientportal.gw
+IB_GATEWAY_DIR=/Applications/clientportal.gw
 
 DATABASE_URL=postgres://<db_user>:<db_password>@localhost:5432/investment_dashboard
 ```
@@ -134,7 +134,7 @@ curl -s http://127.0.0.1:4040/api/tunnels
 
 If you want Interactive Brokers data:
 
-1. Install the Client Portal Gateway outside this repo, ideally at `~/Applications/clientportal.gw`.
+1. Install the Client Portal Gateway outside this repo, ideally at `/Applications/clientportal.gw`.
 2. Start it from the repo root with:
 
 ```bash
@@ -150,7 +150,7 @@ If you want Interactive Brokers data:
 The helper script defaults to:
 
 ```text
-~/Applications/clientportal.gw
+/Applications/clientportal.gw
 ```
 
 That gateway should listen on:

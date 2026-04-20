@@ -23,7 +23,7 @@ These are the values the app currently expects:
 - Database name: `investment_dashboard`
 - IB Gateway host: `127.0.0.1`
 - IB Gateway port: `5002`
-- Recommended IB Gateway install directory: `~/Applications/clientportal.gw`
+- Recommended IB Gateway install directory: `/Applications/clientportal.gw`
 
 The IB port is `5002` because the app expects `https://127.0.0.1:5002`.
 
@@ -42,7 +42,7 @@ Check `.env` before launching anything:
 - `DATABASE_URL` should point to `investment_dashboard` on `localhost:5432`
 - `IB_HOST` should be `127.0.0.1`
 - `IB_GATEWAY_PORT` should be `5002`
-- `IB_GATEWAY_DIR` should point to your local Client Portal Gateway install if you are not using `~/Applications/clientportal.gw`
+- `IB_GATEWAY_DIR` should point to your local Client Portal Gateway install if you are not using `/Applications/clientportal.gw`
 - `SCHWAB_REDIRECT_URI` should exactly match the current ngrok public URL if you want Schwab auth to work
 
 ## Recommended Gateway Layout
@@ -52,7 +52,7 @@ Keep the IB Client Portal Gateway outside this repo so logs, runtime files, and 
 Recommended path:
 
 ```text
-~/Applications/clientportal.gw
+/Applications/clientportal.gw
 ```
 
 If you already have a local copy in this repo from the older setup, move it once to that location, then keep starting it from the repo root with:
@@ -61,7 +61,7 @@ If you already have a local copy in this repo from the older setup, move it once
 ./scripts/start_ib_gateway.sh
 ```
 
-The launcher script reads `IB_GATEWAY_DIR` from your shell or `.env`. If that is missing, it falls back to `~/Applications/clientportal.gw`.
+The launcher script reads `IB_GATEWAY_DIR` from your shell or `.env`. If that is missing, it falls back to `/Applications/clientportal.gw`.
 
 ## Terminal Layout
 
